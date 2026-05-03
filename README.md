@@ -102,6 +102,10 @@ pytest -m e2e -v -s     # full regression suite (boots real Chrome, ~60s)
 - [ ] Add `.claude-plugin/plugin.json` for Claude Code's plugin marketplace system.
 - [ ] Optionally submit to Anthropic's official marketplace via `claude.ai/settings/plugins/submit`.
 
+### TODO (features)
+
+- [ ] **Proxy pool rotation** — currently `StealthOptions(proxy="...")` accepts one proxy per session. For high-volume scraping or geo-distributed scraping, add a `proxy_pool=[...]` option that round-robins (or rotates per-tab / per-N-requests / on-403). Pair w/ residential providers (smartproxy, iproyale, brightdata) for IP reputation. ~80 LoC + a per-tab proxy override via CDP `Network.setExtraHTTPHeaders` + `--proxy-server` per browser instance.
+
 ---
 
 ## 🤖 use as an MCP server (the main use case)
