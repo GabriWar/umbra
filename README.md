@@ -37,17 +37,74 @@
 
 ## 🚀 install
 
-```bash
-git clone <this-repo> && cd umbra
-pip install -e ".[all]"          # all optional deps (markdown, tls, sessions)
+**requirements:** Python 3.10+, a Chromium-based browser (Chrome / Chromium / Edge — auto-detected).
 
-# optional but recommended for the handoff feature:
-sudo pacman -S cloudflared       # arch
-brew install cloudflared         # macos
-apt install cloudflared          # debian/ubuntu
+### 1. clone + install
+
+```bash
+git clone https://github.com/GabriWar/umbra.git
+cd umbra
+pip install -e ".[all]"
 ```
 
-requires Python 3.10+, Chrome / Chromium / Edge (auto-detected).
+`[all]` pulls every optional dep — recommended. To pick & choose:
+
+| extra | enables | install |
+|---|---|---|
+| (default) | core 50 tools, encrypted sessions | `pip install -e .` |
+| `[markdown]` | `extract_markdown` (readability + markdownify) | `pip install -e ".[markdown]"` |
+| `[tls]` | `tls_fetch` (curl_cffi w/ Chrome JA3+JA4) | `pip install -e ".[tls]"` |
+| `[playwright]` | optional Playwright backend | `pip install -e ".[playwright]"` |
+| `[test]` | pytest + asyncio for regression suite | `pip install -e ".[test]"` |
+| `[all]` | everything above | `pip install -e ".[all]"` |
+
+### 2. install cloudflared (recommended — for `handoff_*` tunnel)
+
+The handoff tool exposes a live remote-view of the headless browser via a Cloudflare Quick Tunnel — open a URL on any device, click I'M DONE when done. Without `cloudflared` it falls back to `http://127.0.0.1:PORT` (localhost only).
+
+```bash
+# arch / cachyos
+sudo pacman -S cloudflared
+# debian / ubuntu
+sudo apt install cloudflared
+# macos
+brew install cloudflared
+# everywhere else: download the binary from
+#   https://github.com/cloudflare/cloudflared/releases/latest
+```
+
+No signup, no auth, no account.
+
+### 3. wire into Claude Code (or any MCP client)
+
+```bash
+claude mcp add-json umbra '{
+  "type":"stdio",
+  "command":"/full/path/to/your/python",
+  "args":["-m","umbra.server"],
+  "env":{
+    "UMBRA_CONTAINER":"1",
+    "PYTHONPATH":"/full/path/to/umbra/src"
+  }
+}'
+```
+
+Then restart Claude Code → `/mcp` should show `umbra` with 64 tools.
+
+For Cursor / Claude Desktop / other MCP clients, edit their `mcp_servers` config with the same shape.
+
+### 4. verify
+
+```bash
+python -m umbra.server  # ctrl+c after a few seconds — tools should register cleanly
+pytest -m e2e -v -s     # full regression suite (boots real Chrome, ~60s)
+```
+
+### TODO (distribution)
+
+- [ ] Submit to [Smithery.ai](https://smithery.ai) registry — add `smithery.yaml` and tag a release. Auto-indexes for Claude Desktop / Cursor / Cline users.
+- [ ] Add `.claude-plugin/plugin.json` for Claude Code's plugin marketplace system.
+- [ ] Optionally submit to Anthropic's official marketplace via `claude.ai/settings/plugins/submit`.
 
 ---
 
