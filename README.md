@@ -9,8 +9,6 @@
 
 > *umbra — the darkest part of a shadow, where light is fully blocked.*
 
-*umbra (Latin): the darkest part of a shadow, where light is fully blocked.*
-
 Built by merging the best parts of [obscura](https://github.com/h4ckf0r0day/obscura) (per-session fingerprint payload) + [fantoma](https://github.com/Huzy85/fantoma) (zero-mouse ARIA driver) + [stealth-browser-mcp](https://github.com/vibheksoni/stealth-browser-mcp) (nodriver + MCP surface) — and filling in the gaps each one had: the [`Page.enable()` injection bug](https://github.com/GabriWar/umbra/blob/main/src/umbra/stealth/inject.py), real-GPU headless via `--headless=new + ANGLE Vulkan`, dynamic UA-CH version pinning, mDNS-aware WebRTC SDP filter, MCP token-efficient minification, and the `_untrusted: true` cognitive-separation flag on every page-sourced tool response.
 
 ---
