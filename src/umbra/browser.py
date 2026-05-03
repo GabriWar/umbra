@@ -28,8 +28,14 @@ from typing import Any, AsyncIterator
 
 import nodriver as uc
 
+from umbra.nodriver_patch import apply as _apply_nodriver_patches
 from umbra.stealth.blocklist import is_blocked
 from umbra.stealth.inject import install as install_stealth
+
+# Patch nodriver before any Connection or Cookie object is created.
+# Fixes: (1) listener task dying on parser exceptions, (2) Cookie.from_json
+# requiring the dropped sameParty field. See umbra/nodriver_patch.py.
+_apply_nodriver_patches()
 
 log = logging.getLogger("umbra.browser")
 
