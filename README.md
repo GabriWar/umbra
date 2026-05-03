@@ -15,6 +15,26 @@ Built by merging the best parts of [obscura](https://github.com/h4ckf0r0day/obsc
 
 ---
 
+## 🪙 token efficiency
+
+Counter-intuitively, umbra costs LESS context than minimal browser-MCPs (incl. playwright-mcp) on any real agent session — its 64-tool catalog adds ~13KB upfront, but per-call savings recover that within 3 calls and dominate after that.
+
+| | upfront catalog | typical 5-call session | 20-call session |
+|---|---|---|---|
+| playwright-mcp | ~3KB | ~3KB + 5×30KB = **~153KB** | ~3KB + 600KB = **~603KB** |
+| umbra | ~16KB | ~16KB + 5×6KB = **~46KB** | ~16KB + 120KB = **~136KB** |
+
+Per-call wins come from:
+- `extract_markdown` (clean MD via Mozilla Readability + markdownify) instead of raw HTML/innerText dumps
+- `_compact()` everywhere: drops `None` only, columnar layout for 4+ homogeneous arrays w/ constant-column hoisting, word-boundary truncation w/ explicit `...[+Nc, raise max_str to see full]` markers
+- `_untrusted: true` flag (8 bytes) instead of wrapping content in `<external>...</external>` tags
+- columnar `dom_query`: `{"keys":["text","href","rect"],"rows":[...]}` vs `[{text,href,rect,id,cls,value,visible},...]` — 44% smaller on real pages
+- pagination markers (`{_truncated, shown, total, more_via}`) so callers see WHAT was truncated and HOW to lift the cap
+
+Toggle off via `set_verbosity('full')` when you need raw byte-exact output.
+
+---
+
 ## ⚡ in numbers
 
 | | umbra |
