@@ -466,6 +466,10 @@ class StealthBrowser:
         check_trackers = self.options.block_trackers
 
         async def _on_request(event: Any) -> None:
+            # Defer to RouteEngine if it has taken ownership (server.py routes/HAR
+            # tools install RouteEngine which integrates tracker+resource blocking).
+            if getattr(tab, "_umbra_route_engine_owns", False):
+                return
             req = event.request
             url = req.url
             # event.resource_type is a CDP enum (not str); coerce safely.

@@ -11,7 +11,12 @@
   Page tools         evaluate / inject_css / clone_element
   Devtools           get_console_logs / get_network_requests / get_response_body / memory_metrics
   Cookies/net        get_cookies / set_cookies / clear_cookies / clear_logs / block_urls
-                     set_extra_headers / set_viewport / dynamic_hook
+                     set_extra_headers / set_viewport / dynamic_hook  (legacy)
+  Interception       route_add / route_add_many / route_remove / route_set_enabled /
+                     route_block_set / route_list / route_captures
+                     (block/fulfill/continue/modify/tee/redirect — full Fetch graph)
+  HAR                har_record_start / har_record_stop / har_dump / har_clear /
+                     har_replay_load  (HAR-1.2 record + replay)
   Stealth            check_detection / warm_session / rotate_fingerprint
   Handoff            handoff_start / handoff_wait / request_user_input  (live remote view → user solves → resume)
   TLS                tls_fetch  (raw HTTP w/ Chrome JA3, skip browser entirely)
@@ -33,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 from typing import Any, Literal
 
@@ -41,6 +47,7 @@ from fastmcp import FastMCP
 from umbra.browser import StealthBrowser, StealthOptions
 from umbra.driver.aria import AriaDriver
 from umbra.driver import utils as tab_utils
+from umbra.driver.intercept import RouteEngine, load_har_text
 
 log = logging.getLogger("umbra.server")
 
@@ -94,6 +101,27 @@ SCRAPE STRUCTURED DATA
   → `grep_text`    regex hunt for specific token
   → `extract_links` link audit / build crawl frontier
   → `evaluate`     fall-through for arbitrary JS-driven extraction
+
+INTERCEPT / MOCK / SPY ON NETWORK
+  → `route_add`           full Fetch graph: block / fulfill / continue / modify
+                          / tee / redirect. Match on url_pattern, url_regex,
+                          method, resource_type, header_match, status_min/max.
+                          Custom error_reason for chaos. delay_ms for latency
+                          injection. capture=N buffers req+resp+body per rule.
+                          priority=N ranks rules. times=N auto-disables.
+  → `route_add_many`      bulk install (one round-trip)
+  → `route_captures`      drain a rule's per-rule capture buffer
+  → `route_set_enabled`   pause/resume w/o losing hits/captures
+  → `route_block_set`     toggle inherited tracker / resource_type blocking
+  → `har_record_start`    buffer every paused req+resp into HAR-1.2
+  → `har_dump`            return / write HAR (path= for byte-exact disk write)
+  → `har_replay_load`     load HAR → matching requests fulfilled from corpus
+                          (loose=True to match URL only, ignoring method)
+  Common uses:  stub flaky 3rd-party APIs; offline replay of recorded sessions;
+                inject auth tokens via continue+headers; forge admin role via
+                modify+body_replace; chaos-test w/ block(NameNotResolved) /
+                delay_ms; spy on graphql/XHR via tee+capture; redirect old
+                hosts; record once and replay forever for deterministic tests.
 
 ═══════════════════════════════════════════════════════════════════════════
 ALWAYS PREFER `batch` WHEN YOU HAVE 2+ CALLS IN MIND
@@ -153,8 +181,10 @@ _state: dict[str, Any] = {
     "verbosity": "compact",
     # Per-tab handoff sessions (lazy, only when handoff_start called).
     "handoffs": {},
-    # Per-tab dynamic_hook rules (lazy).
+    # Per-tab dynamic_hook rules (lazy, legacy compat).
     "hooks": {},
+    # Per-tab RouteEngine instances (lazy, full interception graph).
+    "routes": {},
     # Cross-call dedup ledger.
     # {(tab_id, tool, args_hash): {"hash": str, "call_id": str}}
     # When a tool re-runs with identical args + identical result, server
@@ -317,6 +347,26 @@ def _get_tab(tab_id: str) -> Any:
     return entry["tab"]
 
 
+def _get_route(tab_id: str) -> RouteEngine:
+    tab = _get_tab(tab_id)
+    eng = _state.setdefault("routes", {}).get(tab_id)
+    if eng is None or eng.tab is not tab:
+        # Inherit blocking config from the parent browser opts so RouteEngine
+        # can take over `_wire_blocking`'s job (eliminates dual-handler race).
+        try:
+            browser = _get_browser_for_tab(tab_id)
+            opts = browser.options
+            tracker_block = bool(getattr(opts, "block_trackers", True))
+            block_resource_types = set(getattr(opts, "block_resources", ()) or ())
+        except Exception:  # noqa: BLE001
+            tracker_block = True
+            block_resource_types = set()
+        eng = RouteEngine(tab, tracker_block=tracker_block,
+                           block_resource_types=block_resource_types)
+        _state["routes"][tab_id] = eng
+    return eng
+
+
 def _get_aria(tab_id: str) -> AriaDriver:
     entry = _state["tabs"].get(tab_id)
     if entry is None:
@@ -412,6 +462,7 @@ async def kill_all() -> dict[str, Any]:
     _state["browsers"] = {}
     _state["tabs"] = {}
     _state["hooks"] = {}
+    _state["routes"] = {}
     return _compact({"browsers": n_browsers, "tabs": n_tabs, "handoffs": n_handoffs})
 
 
@@ -428,6 +479,8 @@ async def close_browser(browser_id: str) -> dict[str, Any]:
     for tid, entry in list(_state["tabs"].items()):
         if entry["browser_id"] == browser_id:
             _state["tabs"].pop(tid, None)
+            _state.get("routes", {}).pop(tid, None)
+            _state.get("hooks", {}).pop(tid, None)
             closed_tabs.append(tid)
     await browser.stop()
     return _compact({"closed_browser": browser_id, "closed_tabs": closed_tabs})
@@ -1007,62 +1060,327 @@ async def dynamic_hook(tab_id: str, url_pattern: str, action: str,
                         new_status: int | None = None,
                         new_body: str | None = None,
                         new_headers: dict[str, str] | None = None) -> dict[str, Any]:
-    """Network rule. action='block'/'fulfill'/'continue'. url_pattern=substring match.
-    Tab-scoped. For API stubs, surgical blocks, synthetic errors.
+    """Network rule (legacy thin wrapper around `route_add`). action='block'/'fulfill'/'continue'.
+    url_pattern=substring match. Tab-scoped. For richer matching/modify/HAR use `route_add`.
 
-    Ex: dynamic_hook('t0', '/api/items', 'fulfill', new_status=200, new_body='{"items":[]}')
-        → {"installed":{...},"active_hooks":1}
-    Ex: dynamic_hook('t0', 'tracker.evil.com', 'block') → {"installed":{...},"active_hooks":2}"""
-    import nodriver as uc
-    cdp = uc.cdp
-    tab = _get_tab(tab_id)
-    # Lazy enable Fetch domain on first hook
-    hooks = _state.setdefault("hooks", {}).setdefault(tab_id, [])
-    rule = {"pattern": url_pattern, "action": action, "status": new_status,
-            "body": new_body, "headers": new_headers or {}}
-    hooks.append(rule)
+    Ex: dynamic_hook('t0', '/api/items', 'fulfill', new_status=200, new_body='{"items":[]}')"""
+    eng = _get_route(tab_id)
+    rule = eng.new_rule(action=action, url_pattern=url_pattern,
+                         status=new_status, body=new_body, headers=new_headers)
+    await eng.ensure_wired()
+    return _compact({"installed": rule.to_dict(), "active_routes": len(eng.rules)})
 
-    if not getattr(tab, "_umbra_fetch_enabled", False):
-        await tab.send(cdp.fetch.enable())
-        tab._umbra_fetch_enabled = True
 
-        async def _on_paused(event: Any) -> None:
-            url = event.request.url
-            for h in hooks:
-                if h["pattern"] in url:
-                    try:
-                        if h["action"] == "block":
-                            await tab.send(cdp.fetch.fail_request(
-                                request_id=event.request_id,
-                                error_reason=cdp.network.ErrorReason.BLOCKED_BY_CLIENT,
-                            ))
-                        elif h["action"] == "fulfill":
-                            import base64 as _b64
-                            body_b64 = _b64.b64encode((h["body"] or "").encode()).decode()
-                            response_headers = [
-                                cdp.fetch.HeaderEntry(name=k, value=v)
-                                for k, v in (h["headers"] or {}).items()
-                            ]
-                            await tab.send(cdp.fetch.fulfill_request(
-                                request_id=event.request_id,
-                                response_code=h["status"] or 200,
-                                response_headers=response_headers,
-                                body=body_b64,
-                            ))
-                        else:
-                            await tab.send(cdp.fetch.continue_request(request_id=event.request_id))
-                    except Exception:  # noqa: BLE001
-                        pass
-                    return
-            # No hook matched — let it through
-            try:
-                await tab.send(cdp.fetch.continue_request(request_id=event.request_id))
-            except Exception:  # noqa: BLE001
-                pass
+@mcp.tool()
+async def route_add(
+    tab_id: str,
+    action: str,
+    *,
+    url_pattern: str | None = None,
+    url_regex: str | None = None,
+    method: str | None = None,
+    resource_type: str | None = None,
+    header_match: dict[str, str] | None = None,
+    status_min: int | None = None,
+    status_max: int | None = None,
+    error_reason: str = "BlockedByClient",
+    status: int | None = None,
+    headers: dict[str, str] | None = None,
+    body: str | None = None,
+    body_b64: str | None = None,
+    new_url: str | None = None,
+    new_method: str | None = None,
+    new_post_data: str | None = None,
+    body_replace: list[list[str]] | None = None,
+    delay_ms: int = 0,
+    times: int | None = None,
+    priority: int = 0,
+    capture: int = 0,
+    enabled: bool = True,
+    rule_id: str | None = None,
+) -> dict[str, Any]:
+    """Install rich interception rule. action: block|fulfill|continue|modify|tee|redirect.
 
-        tab.add_handler(cdp.fetch.RequestPaused, _on_paused)
+    MATCH (AND of any provided):
+      url_pattern      substring (cheap, default)
+      url_regex        re.fullmatch
+      method           GET/POST/...
+      resource_type    Document/XHR/Fetch/Script/Stylesheet/Image/Font/Media/...
+      header_match     {header_lower: regex} — re.search per header
+      status_min/max   response-stage filter (forces response-stage interception)
 
-    return _compact({"installed": rule, "active_hooks": len(hooks)})
+    ACTIONS:
+      block       fail_request(error_reason=...) — synth net error / chaos
+                   reasons: BlockedByClient, Failed, Aborted, TimedOut, AccessDenied,
+                   ConnectionFailed, ConnectionReset, ConnectionClosed, ConnectionRefused,
+                   ConnectionAborted, NameNotResolved, AddressUnreachable,
+                   InternetDisconnected, BlockedByResponse
+                   (response-stage block synthesizes 5xx via fulfill — Chrome rejects
+                    several reasons at response stage)
+      fulfill    serve fake response (status default 200, headers, body|body_b64)
+      continue   pass through w/ optional rewrite (new_url/new_method/new_post_data/headers).
+                   At response stage: only status/headers overrideable.
+      modify     response-stage rewrite. getResponseBody → body_replace [[regex,repl],...]
+                   OR body/body_b64 outright. status/headers optional override.
+      tee        pass through unchanged + capture into rule.captures (spy mode).
+                   Forces response-stage interception so body is captured.
+      redirect   fulfill w/ status (default 302) + Location header → new_url.
+
+    EXTRAS:
+      delay_ms   sleep before action (latency injection / chaos)
+      times      auto-disable after N matches
+      priority   higher fires first (default 0); ties → insertion order
+      capture    keep last N (req, resp+body) pairs in rule.captures (read via route_captures)
+      enabled    pause without removing (default True)
+      rule_id    stable id (else auto-assigned)
+
+    Ex: route_add('t0','fulfill',url_pattern='/api/items',status=200,body='{"items":[]}')
+    Ex: route_add('t0','block',url_regex=r'.*\\.png$',error_reason='ConnectionFailed')
+    Ex: route_add('t0','modify',url_pattern='/v1/me',body_replace=[['"role":"user"','"role":"admin"']])
+    Ex: route_add('t0','continue',url_pattern='/api',headers={'x-token':'spoof'})
+    Ex: route_add('t0','block',url_pattern='/track',delay_ms=2000,times=3)
+    Ex: route_add('t0','tee',url_pattern='/graphql',capture=20)  # spy on graphql
+    Ex: route_add('t0','redirect',url_pattern='/old',new_url='https://new.com/path')
+    Ex: route_add('t0','block',status_min=500,status_max=599)  # block all 5xx responses
+    → {"installed":{...},"active_routes":N,"response_stage":bool}"""
+    eng = _get_route(tab_id)
+    rule = eng.new_rule(
+        id=rule_id, action=action,
+        url_pattern=url_pattern, url_regex=url_regex, method=method,
+        resource_type=resource_type, header_match=header_match,
+        status_min=status_min, status_max=status_max,
+        error_reason=error_reason, status=status, headers=headers,
+        body=body, body_b64=body_b64,
+        new_url=new_url, new_method=new_method, new_post_data=new_post_data,
+        body_replace=body_replace, delay_ms=delay_ms, times=times,
+        priority=priority, capture=capture, enabled=enabled,
+    )
+    await eng.ensure_wired()
+    return _compact({
+        "installed": rule.to_dict(),
+        "active_routes": len(eng.rules),
+        "response_stage": "Response" in eng._enabled_stages,
+    })
+
+
+@mcp.tool()
+async def route_add_many(tab_id: str, rules: list[dict[str, Any]]) -> dict[str, Any]:
+    """Bulk-install rules in one round-trip. Each item is a dict matching `route_add` kwargs
+    (must contain at least `action`). Returns list of installed rule ids.
+
+    Ex: route_add_many('t0', [
+          {'action':'block','url_pattern':'doubleclick.net'},
+          {'action':'fulfill','url_pattern':'/api/me','status':200,'body':'{"id":1}'},
+          {'action':'tee','url_pattern':'/graphql','capture':50,'priority':10},
+        ])
+    → {"installed":["r0","r1","r2"],"active_routes":3,"response_stage":true}"""
+    eng = _get_route(tab_id)
+    ids: list[str] = []
+    for spec in rules:
+        action = spec.pop("action", None) or spec.pop("type", None)
+        if not action:
+            raise ValueError(f"rule missing 'action': {spec}")
+        rid = spec.pop("rule_id", None) or spec.pop("id", None)
+        rule = eng.new_rule(id=rid, action=action, **spec)
+        ids.append(rule.id)
+    await eng.ensure_wired()
+    return _compact({
+        "installed": ids,
+        "active_routes": len(eng.rules),
+        "response_stage": "Response" in eng._enabled_stages,
+    })
+
+
+@mcp.tool()
+async def route_block_set(tab_id: str, *, trackers: bool | None = None,
+                            resource_types: list[str] | None = None) -> dict[str, Any]:
+    """Toggle the engine's inherited blocking. `trackers`: enable/disable the
+    bundled 3520-domain tracker blocklist (yoyo). `resource_types`: replace the
+    blocked resource-type set (e.g. ['Image','Media','Font'] for fast scraping).
+    Pass nothing to just inspect current state.
+
+    Ex: route_block_set('t0', trackers=False) → {"trackers":false,"resource_types":[]}
+    Ex: route_block_set('t0', resource_types=['Image','Font','Media'])
+    Ex: route_block_set('t0') → {"trackers":true,"resource_types":[],"tracker_blocks":42}"""
+    eng = _get_route(tab_id)
+    if trackers is not None:
+        eng.tracker_block = bool(trackers)
+    if resource_types is not None:
+        eng.block_resource_types = {t.lower() for t in resource_types}
+    await eng.ensure_wired()
+    return _compact({
+        "trackers": eng.tracker_block,
+        "resource_types": sorted(eng.block_resource_types),
+        "tracker_blocks": eng.tracker_blocks_count,
+        "resource_blocks": eng.resource_type_blocks_count,
+    })
+
+
+@mcp.tool()
+async def route_set_enabled(tab_id: str, rule_id: str, enabled: bool) -> dict[str, Any]:
+    """Pause or resume a rule without removing it. Preserves hits/captures.
+
+    Ex: route_set_enabled('t0','r2',False) → {"id":"r2","enabled":false,"hits":12}"""
+    eng = _get_route(tab_id)
+    r = eng.find(rule_id)
+    if r is None:
+        raise ValueError(f"unknown rule_id {rule_id!r}")
+    r.enabled = enabled
+    await eng.ensure_wired()
+    return _compact({"id": r.id, "enabled": r.enabled, "hits": r.hits})
+
+
+@mcp.tool()
+async def route_captures(tab_id: str, rule_id: str, *, clear: bool = False,
+                          max_str: int = 4000) -> dict[str, Any]:
+    """Return per-rule capture buffer (filled when rule has `capture=N`).
+    Each entry: {ts, url, method, status, request_headers, body, body_encoding?, error?}.
+    Use `clear=True` to drain after read.
+
+    Ex: route_captures('t0','r2') → {"_untrusted":true,"id":"r2","captures":[...]}"""
+    eng = _get_route(tab_id)
+    r = eng.find(rule_id)
+    if r is None:
+        raise ValueError(f"unknown rule_id {rule_id!r}")
+    out = list(r.captures)
+    if clear:
+        r.captures.clear()
+    return _compact({"_untrusted": True, "id": r.id, "hits": r.hits,
+                      "captures": out, "cleared": clear}, max_str=max_str)
+
+
+@mcp.tool()
+async def route_remove(tab_id: str, rule_id: str | None = None,
+                        all: bool = False) -> dict[str, Any]:
+    """Remove one rule (rule_id) or all rules (all=True). Doesn't disable Fetch domain.
+
+    Ex: route_remove('t0', 'r2') → {"removed":"r2","active_routes":3}
+    Ex: route_remove('t0', all=True) → {"cleared":5,"active_routes":0}"""
+    eng = _get_route(tab_id)
+    if all:
+        n = eng.clear()
+        return _compact({"cleared": n, "active_routes": 0})
+    if not rule_id:
+        raise ValueError("pass rule_id or all=True")
+    ok = eng.remove(rule_id)
+    return _compact({"removed": rule_id if ok else None,
+                      "missing": None if ok else rule_id,
+                      "active_routes": len(eng.rules)})
+
+
+@mcp.tool()
+async def route_list(tab_id: str) -> dict[str, Any]:
+    """List active rules + per-rule hit counts.
+
+    Ex: route_list('t0') → {"routes":[{"id":"r0","action":"block","hits":12,...}]}"""
+    eng = _get_route(tab_id)
+    return _compact({
+        "routes": eng.list_dicts(),
+        "stages": sorted(eng._enabled_stages),
+        "har_recording": eng.har_recording,
+        "har_replay_loaded": len(eng.har_replay_index),
+    })
+
+
+@mcp.tool()
+async def har_record_start(tab_id: str) -> dict[str, Any]:
+    """Begin buffering every paused req+resp into a HAR-1.2 archive (tab-scoped).
+    Body capture is best-effort (skipped for fulfilled/blocked requests). Forces
+    response-stage interception to capture status+body.
+
+    Ex: har_record_start('t0') → {"recording":true,"existing_entries":0}"""
+    eng = _get_route(tab_id)
+    eng.har_recording = True
+    await eng.ensure_wired()
+    return _compact({"recording": True, "existing_entries": len(eng.har_entries)})
+
+
+@mcp.tool()
+async def har_record_stop(tab_id: str) -> dict[str, Any]:
+    """Stop recording (keeps buffered entries — call har_dump to retrieve, har_clear to drop).
+
+    Ex: har_record_stop('t0') → {"recording":false,"entries":42}"""
+    eng = _get_route(tab_id)
+    eng.har_recording = False
+    return _compact({"recording": False, "entries": len(eng.har_entries)})
+
+
+@mcp.tool()
+async def har_dump(tab_id: str, path: str | None = None,
+                    clear: bool = False, max_str: int = 8000,
+                    max_list: int = 500) -> dict[str, Any]:
+    """Return recorded HAR. With `path`, write full JSON to disk (no truncation, no
+    _compact) and return summary. Without `path`, returns the HAR inline through
+    `_compact` w/ tunable `max_str` (per body) and `max_list` (entry count).
+
+    For full-fidelity inline dump, raise both caps OR write to disk. Disk write
+    is byte-exact.
+
+    Ex: har_dump('t0') → {"_untrusted":true,"har":{...},"entries":42}
+    Ex: har_dump('t0', path='/tmp/session.har', clear=True)
+        → {"wrote":"/tmp/session.har","bytes":98231,"entries":42,"cleared":true}
+    Ex: har_dump('t0', max_str=50000)  # don't truncate JSON bodies up to 50KB"""
+    eng = _get_route(tab_id)
+    har = eng.har_dump()
+    n = len(eng.har_entries)
+    if path:
+        from pathlib import Path
+        text = json.dumps(har)
+        Path(path).write_text(text, encoding="utf-8")
+        if clear:
+            eng.har_entries.clear()
+        return _compact({"wrote": path, "bytes": len(text),
+                          "entries": n, "cleared": clear})
+    if clear:
+        eng.har_entries.clear()
+    return _compact({"_untrusted": True, "har": har, "entries": n, "cleared": clear},
+                     max_str=max_str, max_list=max_list)
+
+
+@mcp.tool()
+async def har_replay_load(tab_id: str, path: str | None = None,
+                            har_json: str | None = None,
+                            loose: bool = False, clear_existing: bool = False) -> dict[str, Any]:
+    """Load a HAR file (path) or raw JSON string (har_json) into the replay corpus.
+    Subsequent matching requests (method+url, or url-only when loose=True) are fulfilled
+    from the HAR entry instead of hitting the network. Replay is fallthrough — it only
+    fires on requests no `route_add` rule already matched.
+
+    Ex: har_replay_load('t0', path='/tmp/session.har') → {"loaded":42,"loose":false}
+    Ex: har_replay_load('t0', har_json='{"log":{"entries":[...]}}', loose=True)
+    → {"loaded":N,"loose":true,"total_loaded":N}"""
+    eng = _get_route(tab_id)
+    if clear_existing:
+        eng.har_clear_replay()
+    if path:
+        from pathlib import Path
+        text = Path(path).read_text(encoding="utf-8")
+    elif har_json:
+        text = har_json
+    else:
+        raise ValueError("pass path= or har_json=")
+    data = load_har_text(text)
+    n = eng.har_load(data, loose=loose)
+    await eng.ensure_wired()
+    return _compact({"loaded": n, "loose": loose,
+                      "total_loaded": len(eng.har_replay_index)})
+
+
+@mcp.tool()
+async def har_clear(tab_id: str, *, recording: bool = True,
+                    replay: bool = False) -> dict[str, Any]:
+    """Drop buffered HAR entries (recording=True, default) and/or the replay corpus.
+
+    Ex: har_clear('t0') → {"cleared_entries":42}
+    Ex: har_clear('t0', recording=False, replay=True) → {"cleared_replay":120}"""
+    eng = _get_route(tab_id)
+    out: dict[str, Any] = {}
+    if recording:
+        out["cleared_entries"] = len(eng.har_entries)
+        eng.har_entries.clear()
+    if replay:
+        out["cleared_replay"] = eng.har_clear_replay()
+    return _compact(out)
 
 
 @mcp.tool()

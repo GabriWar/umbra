@@ -5,7 +5,7 @@
 # umbra
 
 > **The de-facto MCP server for stealth browser automation.**
-> Real Chrome, 0% creepjs detection, 31/31 sannysoft, 65 broad tools, multi-browser orchestration, encrypted sessions, prompt-injection signaling, and live human handoff over a Cloudflare tunnel — for AI agents that need to browse the web like a human, not a bot.
+> Real Chrome, 0% creepjs detection, 31/31 sannysoft, 77 broad tools, multi-browser orchestration, encrypted sessions, prompt-injection signaling, and live human handoff over a Cloudflare tunnel — for AI agents that need to browse the web like a human, not a bot.
 
 > *umbra — the darkest part of a shadow, where light is fully blocked.*
 
@@ -15,7 +15,7 @@ Built by merging the best parts of [obscura](https://github.com/h4ckf0r0day/obsc
 
 ## 🪙 token efficiency
 
-Counter-intuitively, umbra costs LESS context than minimal browser-MCPs (incl. playwright-mcp) on any real agent session — its 65-tool catalog adds ~13KB upfront, but per-call savings recover that within 3 calls and dominate after that.
+Counter-intuitively, umbra costs LESS context than minimal browser-MCPs (incl. playwright-mcp) on any real agent session — its 77-tool catalog adds ~13KB upfront, but per-call savings recover that within 3 calls and dominate after that.
 
 | | upfront catalog | typical 5-call session | 20-call session |
 |---|---|---|---|
@@ -41,7 +41,7 @@ Toggle off via `set_verbosity('full')` when you need raw byte-exact output.
 | **creepjs `headless`** | **0 %** (matches vanilla Chrome) |
 | **creepjs `stealth`** | **0 %** |
 | **CDP automation tells** stripped | `webdriver` `cdc_*` `$cdc_` `_phantom` `_selenium` `__webdriver_*` `__nightmare` ... |
-| **MCP tools** | **65** (broad primitives + `batch` flagship, not 95 narrow ones) |
+| **MCP tools** | **77** (broad primitives + `batch` flagship, not 95 narrow ones) |
 | **headless** | real GPU via `--headless=new + ANGLE Vulkan` (no SwiftShader tell) |
 | **TLS / JA3** | real Chrome stack + optional `curl_cffi` for raw HTTP |
 | **WebRTC** | mDNS-aware SDP filter (real-Chrome behavior, no LAN IP leak) |
@@ -104,7 +104,7 @@ claude mcp add-json umbra '{
 }'
 ```
 
-Then restart Claude Code → `/mcp` should show `umbra` with 65 tools.
+Then restart Claude Code → `/mcp` should show `umbra` with 77 tools.
 
 For Cursor / Claude Desktop / other MCP clients, edit their `mcp_servers` config with the same shape.
 
@@ -125,7 +125,7 @@ pytest -m e2e -v -s     # full regression suite (boots real Chrome, ~60s)
 
 - [ ] **Proxy pool rotation** — currently `StealthOptions(proxy="...")` accepts one proxy per session. For high-volume scraping or geo-distributed scraping, add a `proxy_pool=[...]` option that round-robins (or rotates per-tab / per-N-requests / on-403). Pair w/ residential providers (smartproxy, iproyale, brightdata) for IP reputation. ~80 LoC + a per-tab proxy override via CDP `Network.setExtraHTTPHeaders` + `--proxy-server` per browser instance.
 
-- [ ] **Full request interception graph** — current `block_urls` + `dynamic_hook` cover block/header-injection patterns, but playwright-mcp wins on deep interception: per-request `route()` w/ `fulfill / continue / abort`, body rewrite, response stubbing, HAR replay, conditional-on-headers matching. Build via CDP `Fetch.enable + Fetch.requestPaused` (already wired for hooks) + a richer match DSL — `route(pattern, handler)` returning `{action, status, body, headers, delay_ms}`. Unlocks offline replay + auth-token swap + chaos testing.
+- [x] **Full request interception graph** — shipped as `route_add` / `route_add_many` / `route_remove` / `route_set_enabled` / `route_block_set` / `route_list` / `route_captures` + `har_record_start/stop/dump/clear` + `har_replay_load`. Match DSL: `url_pattern`, `url_regex`, `method`, `resource_type`, `header_match`, `status_min/max`. Actions: `block` (14 custom `error_reason`s; response-stage block synthesizes 5xx via fulfill), `fulfill` (status+headers+body|body_b64), `continue` (request rewrite: new_url/new_method/new_post_data/headers — headers MERGED w/ originals, not replaced), `modify` (response-stage `getResponseBody` → `body_replace=[[regex,repl],...]` or outright body/status/headers override), `tee` (pure spy: pass-through + capture body), `redirect` (synth 302 + Location). Per-rule `delay_ms` (latency injection), `times` (auto-disable after N hits), `priority` (higher fires first), `capture` (per-rule cross-stage body buffer for any action), `enabled` (pause without remove). HAR-1.2 record/replay (`loose` URL-only mode for query-string drift). Tracker/resource blocking from `StealthOptions(block_trackers=, block_resources=)` integrated into the same engine — single Fetch handler, no double-fire race. `dynamic_hook` kept as legacy thin wrapper. Engine: `src/umbra/driver/intercept.py`.
 
 - [ ] **Battle-test the ARIA tree on edge cases** — fantoma-derived snapshot covers the 95% case (forms, lists, dialogs, nav) but real-world weirdness still exposes gaps: shadow-DOM-inside-iframe-inside-shadow-DOM, custom elements w/ delegated focus, `<canvas>`-rendered "trees" (Figma/Notion), virtual-scroll lists where ARIA indexes shift mid-snapshot, `aria-owns` cross-references, RTL/i18n role inflections. Need a regression corpus (gmail, github, notion, figma, linear, jira, gov forms) + property-based tests so we don't regress as nodriver/Chrome update. Playwright's accessibility tree has a decade of these baked in — ours is ~6 months.
 
@@ -142,11 +142,11 @@ claude mcp add-json umbra '{
 }'
 ```
 
-Now your agent has 65 MCP tools for stealth Chrome automation. Cursor, Claude Desktop, Claude Code — anything MCP.
+Now your agent has 77 MCP tools for stealth Chrome automation. Cursor, Claude Desktop, Claude Code — anything MCP.
 
 ---
 
-## 🧰 the 65 tools
+## 🧰 the 77 tools
 
 ```
                   ┌─ browser            spawn / close / list_browsers / close_browser /
@@ -293,7 +293,7 @@ list_browsers()
 | tracker/fp-script blocking | ✓ (3520) | ✗ | ✗ | ✓ (3520 + dynamic hooks) |
 | session warming (cookie age) | ✗ | ✗ | ✗ | ✓ (4 profiles) |
 | live human handoff | ✗ | ✗ | ✗ | ✓ (cloudflared tunnel) |
-| MCP tool surface | ✗ | ✗ | ✓ (95 narrow) | ✓ (65 broad) |
+| MCP tool surface | ✗ | ✗ | ✓ (95 narrow) | ✓ (77 broad) |
 | prompt-injection signaling | ✗ | ✗ | ✗ | ✓ (`_untrusted: true` on all extraction) |
 
 ---
