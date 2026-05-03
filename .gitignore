@@ -1,0 +1,33 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.venv/
+venv/
+env/
+build/
+dist/
+*.whl
+
+# native build artifacts (rebuilt via `make -C native`)
+native/libumbra_shim.so
+native/*.o
+
+# editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# umbra runtime
+*.fern
+__umbra_*
+.umbra/
