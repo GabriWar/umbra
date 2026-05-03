@@ -291,7 +291,15 @@ runs `bot.sannysoft.com` + `creepjs` + UA-CH consistency + automation-tell check
 
 ## 📜 license
 
-MIT. third-party attributions in `LICENSE`:
+**MIT + Attribution Requirement.** Free for any use (commercial, research, hobby) — but if you ship it in a product or publish research using it, please credit:
+
+```markdown
+Powered by [umbra](https://github.com/GabriWar/umbra) by Gabriel Duarte Guerra.
+```
+
+(in your README, docs, about page, or paper acknowledgements — anywhere a human reading your project can see it).
+
+Third-party attributions in `LICENSE`:
 
 - `stealth/payload.js` patterns from h4ckf0r0day/obscura (Apache-2.0)
 - `stealth/tracker_domains.txt` from obscura (Peter Lowe ad/tracker host file)

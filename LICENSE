@@ -1,6 +1,6 @@
-MIT License
+MIT License with Attribution Requirement
 
-Copyright (c) 2026 Gabriel
+Copyright (c) 2026 Gabriel Duarte Guerra
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -9,8 +9,24 @@ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 copies of the Software, and to permit persons to whom the Software is
 furnished to do so, subject to the following conditions:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. The above copyright notice and this permission notice shall be included in
+   all copies or substantial portions of the Software.
+
+2. ATTRIBUTION REQUIREMENT — If you use this Software (modified or unmodified)
+   in any public-facing product, hosted service, research publication, or any
+   project distributed to users beyond yourself, you must provide visible
+   credit to "Gabriel Duarte Guerra" and a link to
+   https://github.com/GabriWar/umbra in at least ONE of:
+
+     a. The README, documentation, or "about" page of your project.
+     b. The credits / acknowledgements / references of any published paper,
+        article, blog post, or whitepaper that relies on this Software.
+     c. The user-facing UI of your product (footer, splash screen, settings,
+        or about dialog).
+
+   "Visible" means a human reading the materials in (a)-(c) can find the
+   credit without specifically searching for it. A LICENSE file alone does
+   not satisfy this requirement.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
@@ -22,21 +38,22 @@ SOFTWARE.
 
 ────────────────────────────────────────────────────────────────────────────
 
-Third-party attribution:
+Third-party attribution (also subject to their own licenses):
 
-  * stealth/payload.js draws on patterns from h4ckf0r0day/obscura
+  * src/umbra/stealth/payload.js draws on patterns from h4ckf0r0day/obscura
     (Apache-2.0, https://github.com/h4ckf0r0day/obscura) — specifically the
     Function.prototype.toString masking strategy, per-session deterministic
     fingerprint seed, GPU/screen pools, and Intl.DateTimeFormat wrap.
     Reimplemented for real Chrome (Object.defineProperty patches over an
     existing browser, not a from-scratch JS environment).
 
-  * stealth/tracker_domains.txt is a copy of obscura's pgl_domains.txt
-    (Apache-2.0, derived from the Peter Lowe ad/tracker host file).
+  * src/umbra/stealth/tracker_domains.txt is a copy of obscura's
+    pgl_domains.txt (Apache-2.0, derived from the Peter Lowe ad/tracker
+    host file).
 
-  * driver/aria.py and stealth/humanizer.py adapt design patterns from
-    Huzy85/fantoma (MIT) — accessibility-tree-first interaction model and
-    Killourhy-Maxion key-pair classification.
+  * src/umbra/driver/aria.py and src/umbra/stealth/humanizer.py adapt
+    design patterns from Huzy85/fantoma (MIT) — accessibility-tree-first
+    interaction model and Killourhy-Maxion key-pair classification.
 
-  * server.py mirrors the FastMCP tool-surface convention used by
-    vibheksoni/stealth-browser-mcp (MIT).
+  * src/umbra/server.py mirrors the FastMCP tool-surface convention used
+    by vibheksoni/stealth-browser-mcp (MIT).
