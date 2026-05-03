@@ -143,11 +143,74 @@ class AriaDriver:
         return interactive
 
     def render_tree(self, max_items: int = 60) -> str:
-        """Pretty-print the current snapshot for an LLM."""
+        """Pretty-print the snapshot for an LLM, with run-length grouping.
+
+        Detects repeating cycles of (role, name) signatures across consecutive
+        elements and collapses them. Lossless: indexes preserve their meaning,
+        and any idx in the range can still be used by `aria_click` / `aria_type`.
+
+        Output examples:
+          [12-77] cycle×13: link("Comments"), link("Permalink"), link("Save"),
+                            link("Reply"), link("Report")
+            ↳ 66 elements at indexes 12..77 are 13 reps of the cycle of 5
+
+          [3-9] repeat×7: button("delete")
+            ↳ 7 identical "delete" buttons at indexes 3..9
+        """
         if not self._index:
             return "(empty — call await snapshot() first)"
-        lines = [n.render() for n in list(self._index.values())[:max_items]]
-        return "\n".join(lines)
+
+        nodes = list(self._index.values())[:max_items]
+
+        def sig(n: "AxNode") -> tuple[str, str]:
+            return (n.role, n.name or "")
+
+        def render_one(n: "AxNode") -> str:
+            return n.render()
+
+        def fmt_cycle_item(s: tuple[str, str]) -> str:
+            role, name = s
+            return f'{role}({name!r})' if name else role
+
+        # Walk and detect runs. Strategy:
+        #   for each position i, find the longest cycle of period p where
+        #   sig[i:i+p] == sig[i+p:i+2p] == ... for k>=2 reps. Greedy: try
+        #   p=1..6 (most real-world repeats are short cycles), pick longest
+        #   total run.
+        out: list[str] = []
+        i = 0
+        n = len(nodes)
+        while i < n:
+            best_p, best_reps = 0, 0
+            sigs = [sig(nodes[j]) for j in range(i, min(i + 12, n))]  # sample window
+            for p in range(1, min(7, len(sigs))):
+                # How many full reps starting at i with period p?
+                if i + 2 * p > n:
+                    break
+                cycle = [sig(nodes[i + k]) for k in range(p)]
+                reps = 1
+                while i + (reps + 1) * p <= n:
+                    nxt = [sig(nodes[i + reps * p + k]) for k in range(p)]
+                    if nxt != cycle:
+                        break
+                    reps += 1
+                # Need at least 2 full reps to be worth grouping
+                if reps >= 2 and reps * p > best_reps * best_p:
+                    best_p, best_reps = p, reps
+            if best_p and best_reps >= 2:
+                cycle = [sig(nodes[i + k]) for k in range(best_p)]
+                start_idx = nodes[i].idx
+                end_idx = nodes[i + best_p * best_reps - 1].idx
+                if best_p == 1:
+                    out.append(f"[{start_idx}-{end_idx}] repeat×{best_reps}: {fmt_cycle_item(cycle[0])}")
+                else:
+                    items = ", ".join(fmt_cycle_item(s) for s in cycle)
+                    out.append(f"[{start_idx}-{end_idx}] cycle×{best_reps} (period {best_p}): {items}")
+                i += best_p * best_reps
+            else:
+                out.append(render_one(nodes[i]))
+                i += 1
+        return "\n".join(out)
 
     async def _resolve_node(self, idx: int) -> Any:
         """Get a remote object handle to the DOM node behind an AX node."""
