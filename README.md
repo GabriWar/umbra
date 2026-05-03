@@ -5,7 +5,7 @@
 # umbra
 
 > **The de-facto MCP server for stealth browser automation.**
-> Real Chrome, 0% creepjs detection, 31/31 sannysoft, 64 broad tools, multi-browser orchestration, encrypted sessions, prompt-injection signaling, and live human handoff over a Cloudflare tunnel — for AI agents that need to browse the web like a human, not a bot.
+> Real Chrome, 0% creepjs detection, 31/31 sannysoft, 65 broad tools, multi-browser orchestration, encrypted sessions, prompt-injection signaling, and live human handoff over a Cloudflare tunnel — for AI agents that need to browse the web like a human, not a bot.
 
 > *umbra — the darkest part of a shadow, where light is fully blocked.*
 
@@ -15,7 +15,7 @@ Built by merging the best parts of [obscura](https://github.com/h4ckf0r0day/obsc
 
 ## 🪙 token efficiency
 
-Counter-intuitively, umbra costs LESS context than minimal browser-MCPs (incl. playwright-mcp) on any real agent session — its 64-tool catalog adds ~13KB upfront, but per-call savings recover that within 3 calls and dominate after that.
+Counter-intuitively, umbra costs LESS context than minimal browser-MCPs (incl. playwright-mcp) on any real agent session — its 65-tool catalog adds ~13KB upfront, but per-call savings recover that within 3 calls and dominate after that.
 
 | | upfront catalog | typical 5-call session | 20-call session |
 |---|---|---|---|
@@ -41,11 +41,12 @@ Toggle off via `set_verbosity('full')` when you need raw byte-exact output.
 | **creepjs `headless`** | **0 %** (matches vanilla Chrome) |
 | **creepjs `stealth`** | **0 %** |
 | **CDP automation tells** stripped | `webdriver` `cdc_*` `$cdc_` `_phantom` `_selenium` `__webdriver_*` `__nightmare` ... |
-| **MCP tools** | **64** (broad primitives, not 95 narrow ones) |
+| **MCP tools** | **65** (broad primitives + `batch` flagship, not 95 narrow ones) |
 | **headless** | real GPU via `--headless=new + ANGLE Vulkan` (no SwiftShader tell) |
 | **TLS / JA3** | real Chrome stack + optional `curl_cffi` for raw HTTP |
 | **WebRTC** | mDNS-aware SDP filter (real-Chrome behavior, no LAN IP leak) |
 | **handoff** | live remote-view via `cloudflared` Quick Tunnel (works VPS → home laptop) |
+| **CDP schema drift** | resilient — survives Chrome field churn (e.g. dropped `sameParty`) without hangs |
 
 ---
 
@@ -103,7 +104,7 @@ claude mcp add-json umbra '{
 }'
 ```
 
-Then restart Claude Code → `/mcp` should show `umbra` with 64 tools.
+Then restart Claude Code → `/mcp` should show `umbra` with 65 tools.
 
 For Cursor / Claude Desktop / other MCP clients, edit their `mcp_servers` config with the same shape.
 
@@ -124,6 +125,10 @@ pytest -m e2e -v -s     # full regression suite (boots real Chrome, ~60s)
 
 - [ ] **Proxy pool rotation** — currently `StealthOptions(proxy="...")` accepts one proxy per session. For high-volume scraping or geo-distributed scraping, add a `proxy_pool=[...]` option that round-robins (or rotates per-tab / per-N-requests / on-403). Pair w/ residential providers (smartproxy, iproyale, brightdata) for IP reputation. ~80 LoC + a per-tab proxy override via CDP `Network.setExtraHTTPHeaders` + `--proxy-server` per browser instance.
 
+- [ ] **Full request interception graph** — current `block_urls` + `dynamic_hook` cover block/header-injection patterns, but playwright-mcp wins on deep interception: per-request `route()` w/ `fulfill / continue / abort`, body rewrite, response stubbing, HAR replay, conditional-on-headers matching. Build via CDP `Fetch.enable + Fetch.requestPaused` (already wired for hooks) + a richer match DSL — `route(pattern, handler)` returning `{action, status, body, headers, delay_ms}`. Unlocks offline replay + auth-token swap + chaos testing.
+
+- [ ] **Battle-test the ARIA tree on edge cases** — fantoma-derived snapshot covers the 95% case (forms, lists, dialogs, nav) but real-world weirdness still exposes gaps: shadow-DOM-inside-iframe-inside-shadow-DOM, custom elements w/ delegated focus, `<canvas>`-rendered "trees" (Figma/Notion), virtual-scroll lists where ARIA indexes shift mid-snapshot, `aria-owns` cross-references, RTL/i18n role inflections. Need a regression corpus (gmail, github, notion, figma, linear, jira, gov forms) + property-based tests so we don't regress as nodriver/Chrome update. Playwright's accessibility tree has a decade of these baked in — ours is ~6 months.
+
 ---
 
 ## 🤖 use as an MCP server (the main use case)
@@ -137,11 +142,11 @@ claude mcp add-json umbra '{
 }'
 ```
 
-Now your agent has 64 MCP tools for stealth Chrome automation. Cursor, Claude Desktop, Claude Code — anything MCP.
+Now your agent has 65 MCP tools for stealth Chrome automation. Cursor, Claude Desktop, Claude Code — anything MCP.
 
 ---
 
-## 🧰 the 64 tools
+## 🧰 the 65 tools
 
 ```
                   ┌─ browser            spawn / close / list_browsers / close_browser /
@@ -179,12 +184,32 @@ Now your agent has 64 MCP tools for stealth Chrome automation. Cursor, Claude De
                   │
                   ├─ files              upload_file / setup_downloads / wait_for_download
                   │
-                  └─ TLS                tls_fetch  (raw HTTP w/ Chrome JA3+JA4)
+                  ├─ TLS                tls_fetch  (raw HTTP w/ Chrome JA3+JA4)
+                  │
+                  └─ batch ⭐ flagship  batch  (N tools in one round-trip; composes w/ dedup)
 ```
 
 ---
 
 ## 🎯 highlight tools
+
+### `batch` ⭐ flagship — N tools in one MCP round-trip
+
+```python
+batch([
+  {"tool": "navigate",        "args": {"tab_id": "t0", "url": "https://news.ycombinator.com"}},
+  {"tool": "wait_for_text",   "args": {"tab_id": "t0", "text": "Hacker News"}},
+  {"tool": "aria_snapshot",   "args": {"tab_id": "t0"}},
+  {"tool": "extract_links",   "args": {"tab_id": "t0", "limit": 30}},
+  {"tool": "extract_markdown","args": {"tab_id": "t0"}},
+])
+# → {"results":[...5 entries with ok/data/ms each...],
+#    "elapsed_ms":1840, "ok_count":5, "fail_count":0}
+```
+
+Serial in declared order, single MCP round-trip. Saves protocol framing per call AND composes with cross-call dedup (identical re-calls inside the batch return `_unchanged_since` instead of full payloads). Use it whenever you have ≥2 calls in mind — it's almost always the right choice.
+
+`stop_on_error=True` short-circuits the batch on first failure (default: keep going + report fail_count).
 
 ### `handoff_start` — when you hit a captcha, hand the wheel back
 
@@ -268,7 +293,7 @@ list_browsers()
 | tracker/fp-script blocking | ✓ (3520) | ✗ | ✗ | ✓ (3520 + dynamic hooks) |
 | session warming (cookie age) | ✗ | ✗ | ✗ | ✓ (4 profiles) |
 | live human handoff | ✗ | ✗ | ✗ | ✓ (cloudflared tunnel) |
-| MCP tool surface | ✗ | ✗ | ✓ (95 narrow) | ✓ (64 broad) |
+| MCP tool surface | ✗ | ✗ | ✓ (95 narrow) | ✓ (65 broad) |
 | prompt-injection signaling | ✗ | ✗ | ✗ | ✓ (`_untrusted: true` on all extraction) |
 
 ---
@@ -319,13 +344,60 @@ every MCP tool response goes through `_compact()`:
 
 **24% average wire-byte savings** on real-world pages (test data on HN/wikipedia). flip with `set_verbosity('full')` when you need raw.
 
+### cross-call dedup ledger
+
+Identical repeat calls return `{"_unchanged_since": "cN", "_hash": "..."}` instead of the full payload — the data is unchanged from call cN, so the agent reuses what it already has in context. Pass `force_refresh=True` to bypass.
+
+```python
+extract_text('t0')   # → call c5: full {text:"...",length:8421,...}
+extract_text('t0')   # → call c6: {"_unchanged_since":"c5","_hash":"a7f2..."}  ← saved 8KB
+```
+
+Pairs perfectly with `batch` — you can blast `[snapshot, snapshot, snapshot]` after each interaction; only the deltas come back.
+
+### ARIA pattern grouping (RLE for snapshots)
+
+Long lists (HN comments, search results, file trees) with repeating `(role, name)` cycles get run-length-encoded losslessly:
+
+```
+[12-77] cycle×13 (period 5): link("Comments"), link("Permalink"), link("Save"), button("Vote"), text("user")
+↳ 66 lines collapsed into 1 — agent still knows the exact range and what's in each cycle
+```
+
+Detects period 1–6 with ≥2 reps. Real HN comments page: ~70% smaller snapshot.
+
+### URL footnoting (host dedup in `extract_links`)
+
+Repeated hosts get factored out once:
+
+```
+{"_hosts": {"h1":"https://github.com", "h2":"https://news.ycombinator.com"},
+ "links": [["h1","/user/foo"], ["h1","/issues/123"], ["h2","/item?id=456"], ...]}
+```
+
+~50% smaller on link-heavy pages. Reconstruct via `_hosts[h] + path`.
+
+---
+
+## 🩹 CDP schema resilience
+
+nodriver's CDP parser hardcodes Chrome protocol field names — when Chrome changes the schema between releases, the parser KeyErrors. Worse, the listener task dies on the unhandled raise → every subsequent CDP call on that tab hangs forever (no awaiter ever wakes up).
+
+umbra ships three monkey-patches in `umbra/nodriver_patch.py` to make this class of bug impossible:
+
+1. **`Transaction.__call__`** — every parser exception becomes `future.set_exception(...)` so the awaiter gets a real error, never a hang.
+2. **`Connection._listener`** — wraps the per-message dispatch so a single bad parse can't kill the listener task; future calls keep working.
+3. **`Cookie.from_json`** — tolerant of Chrome 146+ dropping `sameParty` (matches the pattern already used in `CookieParam.from_json`; upstream inconsistency).
+
+Patches are **idempotent** (per-class flag + module-level short-circuit, safe to call N times) and **partial-failure tolerant** (each patch runs in its own try/except — one failing doesn't block the others). Applied automatically at `umbra.browser` import — zero config.
+
 ---
 
 ## 🏗️ architecture
 
 ```
                   ┌────────────────────────────────────────────┐
-                  │  FastMCP server  (umbra.server, 64 tools)  │
+                  │  FastMCP server  (umbra.server, 65 tools)  │
                   │  + _compact() minification                 │
                   │  + _untrusted prompt-injection signaling   │
                   └────────────────────────────────────────────┘
