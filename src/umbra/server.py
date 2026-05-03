@@ -844,7 +844,7 @@ async def check_detection(deep: bool = False) -> dict[str, Any]:
     Ex (shallow): check_detection() → {"sannysoft":{"passed":31,"failed":0,...},"verdict":"good"}
     Ex (deep):    check_detection(deep=True) → {"sannysoft":{...},"creepjs":{"detected_headless":0,"stealth":0,...},"verdict":"good"}"""
     from umbra.detection import sannysoft_score, creepjs_score
-    browser = await _get_browser()
+    _, browser = await _get_or_create_browser(None)
     s = await sannysoft_score(browser)
     out = {"sannysoft": s}
     if deep:
@@ -867,7 +867,7 @@ async def check_detection(deep: bool = False) -> dict[str, Any]:
 async def warm_session(profile: str = "general", max_sites: int | None = None) -> dict[str, Any]:
     """Pre-warm browser w/ plausible browsing pattern. Profiles: general, shopping, news, minimal."""
     from umbra.warming import warm_session as do_warm
-    browser = await _get_browser()
+    _, browser = await _get_or_create_browser(None)
     await do_warm(browser, profile=profile, max_sites=max_sites)
     return _compact({"warmed": True, "profile": profile})
 
