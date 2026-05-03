@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/icon.svg" alt="umbra" width="160"/>
+  <img src="./assets/banner.png" alt="umbra" width="100%"/>
 </p>
 
 # umbra
