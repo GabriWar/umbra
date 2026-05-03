@@ -3,16 +3,6 @@
 </p>
 
 # umbra
-
-```
-██╗   ██╗███╗   ███╗██████╗ ██████╗  █████╗
-██║   ██║████╗ ████║██╔══██╗██╔══██╗██╔══██╗      stealth chrome
-██║   ██║██╔████╔██║██████╔╝██████╔╝███████║      for AI agents
-██║   ██║██║╚██╔╝██║██╔══██╗██╔══██╗██╔══██║      v0.4
-╚██████╔╝██║ ╚═╝ ██║██████╔╝██║  ██║██║  ██║
- ╚═════╝ ╚═╝     ╚═╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝
-```
-
 > *the darkest part of the shadow — where light is fully blocked.*
 
 > The merged best-of [obscura](https://github.com/h4ckf0r0day/obscura) (per-session fingerprint payload) + [fantoma](https://github.com/Huzy85/fantoma) (zero-mouse ARIA driver) + [stealth-browser-mcp](https://github.com/vibheksoni/stealth-browser-mcp) (nodriver + MCP surface), with the gaps each one had filled in.
@@ -318,11 +308,11 @@ every MCP tool response goes through `_compact()`:
   │ Browser │          │  Drivers │         │  Stealth   │        │  Misc    │
   │  multi  │          │  ARIA    │         │  payload   │        │  session │
   │  inst.  │          │  CDP     │         │  3520 list │        │  handoff │
-  └────┬────┘          │  humanizer        │  detection │        │  tls     │
+  └────┬────┘          │ humanizer│         │  detection │        │    tls   │
        │               └────┬─────┘         └─────┬──────┘        └──────────┘
        ▼                    ▼                     ▼
   ┌──────────────────────────────────────────────────────────────────────┐
-  │  nodriver  (real Chrome via CDP) + Page.addScriptToEvaluateOnNewDocument│
+  │nodriver (real Chrome via CDP) + Page.addScriptToEvaluateOnNewDocument│
   │  --headless=new + --use-angle=vulkan + dynamic UA-CH version pinning │
   └──────────────────────────────────────────────────────────────────────┘
                                        │
