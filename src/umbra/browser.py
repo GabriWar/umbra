@@ -349,15 +349,26 @@ class StealthBrowser:
             log.info("proxy pool acquired entry %s (country=%s)",
                      entry.id, entry.country or "?")
         elif opts.proxy:
-            flags.append(f"--proxy-server={opts.proxy}")
-            # If single-proxy URL has inline auth, extract for CDP install.
+            # Chrome's --proxy-server doesn't accept inline `user:pass@`. If
+            # we pass a creds-bearing URL it silently fails the CONNECT and
+            # the tab ends at chrome-error://chromewebdata/. Strip creds for
+            # the flag, route them through CDP Fetch.authRequired instead
+            # (same path as the pool — see chrome_flag_url() symmetry).
             try:
                 import urllib.parse as _up_local
                 p = _up_local.urlparse(opts.proxy)
                 if p.username and p.password:
                     self._proxy_creds = (p.username, p.password)
+                if p.hostname:
+                    netloc = p.hostname + (f":{p.port}" if p.port else "")
+                    stripped = _up_local.urlunparse(
+                        (p.scheme or "http", netloc, "", "", "", "")
+                    )
+                    flags.append(f"--proxy-server={stripped}")
+                else:
+                    flags.append(f"--proxy-server={opts.proxy}")
             except Exception:  # noqa: BLE001
-                pass
+                flags.append(f"--proxy-server={opts.proxy}")
         if opts.window_size:
             w, h = opts.window_size
             flags.append(f"--window-size={w},{h}")
