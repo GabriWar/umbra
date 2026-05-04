@@ -9,7 +9,7 @@
 
 > *umbra — the darkest part of a shadow, where light is fully blocked.*
 
-Built by merging the best parts of [obscura](https://github.com/h4ckf0r0day/obscura) (per-session fingerprint payload) + [fantoma](https://github.com/Huzy85/fantoma) (zero-mouse ARIA driver) + [stealth-browser-mcp](https://github.com/vibheksoni/stealth-browser-mcp) (nodriver + MCP surface) — and filling in their gaps: the [`Page.enable()` injection bug](https://github.com/GabriWar/umbra/blob/main/src/umbra/stealth/inject.py), real-GPU headless via `--headless=new + ANGLE Vulkan`, dynamic UA-CH version pinning, mDNS-aware WebRTC SDP filter, MCP token-efficient minification, and the `_untrusted: true` cognitive-separation flag on every page-sourced response.
+Built by merging the best parts of [obscura](https://github.com/h4ckf0r0day/obscura) [`536072b`](https://github.com/h4ckf0r0day/obscura/commit/536072b) (per-session fingerprint payload) + [fantoma](https://github.com/Huzy85/fantoma) [`86f20eb`](https://github.com/Huzy85/fantoma/commit/86f20eb) (zero-mouse ARIA driver) + [stealth-browser-mcp](https://github.com/vibheksoni/stealth-browser-mcp) [`def424d`](https://github.com/vibheksoni/stealth-browser-mcp/commit/def424d) (nodriver + MCP surface) — and filling in their gaps: the [`Page.enable()` injection bug](https://github.com/GabriWar/umbra/blob/main/src/umbra/stealth/inject.py), real-GPU headless via `--headless=new + ANGLE Vulkan`, dynamic UA-CH version pinning, mDNS-aware WebRTC SDP filter, MCP token-efficient minification, and the `_untrusted: true` cognitive-separation flag on every page-sourced response.
 
 ---
 
@@ -462,7 +462,7 @@ Powered by [umbra](https://github.com/GabriWar/umbra) by Gabriel Duarte Guerra.
 
 Third-party attributions in `LICENSE`:
 
-- `stealth/payload.js` patterns from h4ckf0r0day/obscura (Apache-2.0)
+- `stealth/payload.js` patterns from h4ckf0r0day/obscura @ [`536072b`](https://github.com/h4ckf0r0day/obscura/commit/536072b) (Apache-2.0)
 - `stealth/tracker_domains.txt` from obscura (Peter Lowe ad/tracker host file)
-- `driver/aria.py` + `humanizer.py` patterns from Huzy85/fantoma (MIT)
-- MCP tool surface convention from vibheksoni/stealth-browser-mcp (MIT)
+- `driver/aria.py` + `humanizer.py` patterns from Huzy85/fantoma @ [`86f20eb`](https://github.com/Huzy85/fantoma/commit/86f20eb) (MIT)
+- MCP tool surface convention from vibheksoni/stealth-browser-mcp @ [`def424d`](https://github.com/vibheksoni/stealth-browser-mcp/commit/def424d) (MIT)
