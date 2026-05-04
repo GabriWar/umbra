@@ -143,6 +143,30 @@ proxy_pool_remove("a3b1...")   # bad rep? drop it
 
 7 MCP tools: `proxy_pool_load`, `proxy_pool_add`, `proxy_pool_remove`, `proxy_pool_clear`, `proxy_pool_list`, `proxy_pool_health_check`, `proxy_pool_export`.
 
+#### route through Tor (free, multi-exit, no provider)
+
+Tor's SOCKS5 supports **stream isolation** — different SOCKS user/pass = different circuit = different exit IP. One `tor` daemon, N distinct exits, zero provider cost:
+
+```bash
+sudo systemctl enable --now tor   # binds 127.0.0.1:9050
+```
+
+```text
+# ~/.umbra/proxies.txt — each line = one isolated circuit (user/pass arbitrary)
+socks5://circ1:x@127.0.0.1:9050#tags=tor
+socks5://circ2:x@127.0.0.1:9050#tags=tor
+socks5://circ3:x@127.0.0.1:9050#tags=tor
+socks5://circ4:x@127.0.0.1:9050#tags=tor
+socks5://circ5:x@127.0.0.1:9050#tags=tor
+```
+
+```python
+proxy_pool_load(data="~/.umbra/proxies.txt")
+spawn(use_proxy_pool=True, proxy_tag="tor")
+```
+
+**caveats** — Tor exits are publicly listed (`check.torproject.org/exit-addresses`); most anti-bot stacks (Cloudflare Bot Mgmt, DataDome, Akamai, PerimeterX) blocklist them. Useful for archive sites / IP-leak testing / gov forms. Useless against hardened scraping targets. Slow: ~3–10s per first req per circuit, 1–3s after warm. Pin exit country via `ExitNodes {us}` in `/etc/tor/torrc` + `systemctl reload tor`.
+
 ### `handoff_start` — captcha / 2FA wall? hand the wheel back
 
 ```
