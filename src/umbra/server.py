@@ -40,11 +40,14 @@ import argparse
 import asyncio
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Any, Literal
 
 from fastmcp import FastMCP
 
 from umbra.browser import StealthBrowser, StealthOptions
+from umbra.proxypool import ProxyPool, parse_proxy_url
 from umbra.driver.aria import AriaDriver
 from umbra.driver import utils as tab_utils
 from umbra.driver.intercept import RouteEngine, load_har_text
@@ -193,6 +196,10 @@ _state: dict[str, Any] = {
     # Lossless: caller can pass force_refresh=True to bypass.
     "call_ledger": {},
     "next_call_n": 0,
+    # Module-level proxy pool — shared across all browsers in this server
+    # process. None until first proxy_pool_load/add. Spawn picks from it
+    # when use_proxy_pool=True.
+    "proxy_pool": None,  # ProxyPool | None
 }
 
 
@@ -335,6 +342,9 @@ async def _get_or_create_browser(browser_id: str | None,
         browser_id = "default"
     if browser_id not in _state["browsers"]:
         b = StealthBrowser(opts or StealthOptions(headless=True, low_memory=True))
+        # Tag the browser w/ its registry id so the proxy pool's
+        # acquire/release uses the same key the user sees.
+        b._pool_browser_id = browser_id
         await b.start()
         _state["browsers"][browser_id] = b
     return browser_id, _state["browsers"][browser_id]
@@ -395,16 +405,30 @@ async def spawn(
     headless: bool = True,
     low_memory: bool = True,
     stealth_mode: Literal["minimal", "full"] = "minimal",
+    use_proxy_pool: bool = False,
+    proxy_country: str | None = None,
+    proxy_tag: str | None = None,
 ) -> dict[str, Any]:
     """Open stealth tab. browser_id='alice'=isolated Chrome (own cookies/identity, ~1.5s boot).
     For same-identity new pages prefer `navigate` (cheaper). stealth_mode='minimal'
     (default)=mimics vanilla Chrome, 'full'=adds anti-tracking noise.
 
+    Proxy: pass `proxy='http://user:pass@host:port'` for one-off, OR set
+    `use_proxy_pool=True` (after `proxy_pool_load`) to pick from the pool —
+    optionally filter by `proxy_country='US'` / `proxy_tag='residential'`.
+    Pool wins over `proxy` if both set. Auth wired via CDP (Chrome flag
+    strips inline auth).
+
     Ex: spawn('https://news.ycombinator.com') → {"tab_id":"t0","browser_id":"default","url":"..."}
-    Ex: spawn('about:blank', browser_id='alice', proxy='http://1.2.3.4:8080')"""
+    Ex: spawn('about:blank', browser_id='alice', proxy='http://1.2.3.4:8080')
+    Ex: spawn(use_proxy_pool=True, proxy_country='US', browser_id='scraper-1')"""
+    pool = _state.get("proxy_pool") if use_proxy_pool else None
+    if use_proxy_pool and pool is None:
+        return _compact({"error": "proxy pool empty — call proxy_pool_load first"})
     opts = StealthOptions(
         headless=headless, low_memory=low_memory, stealth_mode=stealth_mode,
         timezone=timezone, proxy=proxy, user_agent=user_agent,
+        proxy_pool=pool, proxy_country=proxy_country, proxy_tag=proxy_tag,
     )
     bid, browser = await _get_or_create_browser(browser_id, opts)
     tab = await browser.new_tab(url)
@@ -412,7 +436,209 @@ async def spawn(
     _state["next_tab_n"] = n + 1
     tab_id = f"t{n}"
     _state["tabs"][tab_id] = {"browser_id": bid, "tab": tab, "driver": AriaDriver(tab)}
-    return _compact({"tab_id": tab_id, "browser_id": bid, "url": url})
+    out: dict[str, Any] = {"tab_id": tab_id, "browser_id": bid, "url": url}
+    if browser._pool_entry is not None:
+        e = browser._pool_entry
+        out["proxy"] = {
+            "id": e.id,
+            "host": e.chrome_flag_url(),
+            "country": e.country,
+            "tags": list(e.tags),
+            "health": round(e.health, 3),
+        }
+    return _compact(out)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Proxy pool — multi-provider rotation w/ health, geo, sticky sessions.
+# Use:  proxy_pool_load(format='lines', data='http://...\nhttp://...')
+#       spawn(use_proxy_pool=True, proxy_country='US')
+# ═════════════════════════════════════════════════════════════════════════
+
+def _ensure_pool(rotation: str = "round_robin") -> ProxyPool:
+    pool = _state.get("proxy_pool")
+    if pool is None:
+        pool = ProxyPool(rotation=rotation)  # type: ignore[arg-type]
+        _state["proxy_pool"] = pool
+    return pool
+
+
+@mcp.tool()
+async def proxy_pool_load(
+    data: str,
+    format: Literal["lines", "json", "csv"] = "lines",
+    rotation: Literal[
+        "round_robin", "random", "least_used", "best_health", "sticky_browser"
+    ] = "round_robin",
+    replace: bool = False,
+) -> dict[str, Any]:
+    """Bulk-load proxies into the pool.
+
+    format='lines': one URL per line (`http://user:pass@host:port[#country=US,tags=a|b]`)
+    format='json':  list of {url, username?, password?, country?, tags?, session_template?}
+                    OR full pool dict from proxy_pool_export.
+    format='csv':   header w/ columns url, username, password, country, tags, session_template
+    `data` may be inline text OR a file path (auto-detected by existence).
+
+    rotation strategies: round_robin (default), random, least_used, best_health,
+    sticky_browser (same browser_id always gets same entry).
+
+    Ex: proxy_pool_load(data='http://u:p@gw1:8080\\nhttp://u:p@gw2:8080')
+    Ex: proxy_pool_load(data='/path/to/proxies.csv', format='csv')"""
+    pool = _ensure_pool(rotation)
+    if replace:
+        pool.clear()
+    pool.rotation = rotation  # type: ignore[assignment]
+    # Auto-detect file path
+    p = Path(data)
+    if p.exists() and p.is_file():
+        n = pool.load_file(p)
+    elif format == "lines":
+        n = pool.load_lines(data)
+    elif format == "json":
+        n = pool.load_json(data)
+    elif format == "csv":
+        n = pool.load_csv(data)
+    else:
+        return _compact({"error": f"unknown format {format!r}"})
+    return _compact({"loaded": n, "total": len(pool), "rotation": pool.rotation})
+
+
+@mcp.tool()
+async def proxy_pool_add(
+    url: str,
+    username: str | None = None,
+    password: str | None = None,
+    country: str | None = None,
+    tags: list[str] | None = None,
+    session_template: str | None = None,
+) -> dict[str, Any]:
+    """Add ONE proxy to the pool.
+
+    `url` may include inline auth (`http://user:pass@host:port`); explicit
+    username/password override. `session_template` is a provider-specific
+    sticky-session pattern, e.g. 'user-session-{sid}-country-{cc}'.
+
+    Ex: proxy_pool_add('http://gw.proxy.com:8080', username='u123', password='p', country='US')"""
+    pool = _ensure_pool()
+    e = parse_proxy_url(url)
+    if username is not None:
+        e.username = username
+    if password is not None:
+        e.password = password
+    if country is not None:
+        e.country = country
+    if tags:
+        e.tags = tuple(tags)
+    if session_template is not None:
+        e.session_template = session_template
+    pool.add(e)
+    return _compact({"id": e.id, "total": len(pool)})
+
+
+@mcp.tool()
+async def proxy_pool_remove(entry_id: str) -> dict[str, Any]:
+    """Remove one entry by id. Use proxy_pool_list to see ids.
+
+    Ex: proxy_pool_remove('a1b2c3d4') → {"removed":true,"total":4}"""
+    pool = _state.get("proxy_pool")
+    if pool is None:
+        return _compact({"removed": False, "error": "pool empty"})
+    ok = pool.remove(entry_id)
+    return _compact({"removed": ok, "total": len(pool)})
+
+
+@mcp.tool()
+async def proxy_pool_clear() -> dict[str, Any]:
+    """Drop ALL entries. Stickies cleared. Rotation strategy preserved.
+
+    Ex: proxy_pool_clear() → {"cleared":12}"""
+    pool = _state.get("proxy_pool")
+    if pool is None:
+        return _compact({"cleared": 0})
+    return _compact({"cleared": pool.clear()})
+
+
+@mcp.tool()
+async def proxy_pool_list(redact: bool = True) -> dict[str, Any]:
+    """List all entries (creds redacted by default). Columnar.
+
+    Ex: proxy_pool_list() → {"rotation":"round_robin","entries":[...]}"""
+    pool = _state.get("proxy_pool")
+    if pool is None:
+        return _compact({"rotation": None, "entries": [], "total": 0})
+    return _compact(pool.to_dict(redact=redact))
+
+
+@mcp.tool()
+async def proxy_pool_health_check(
+    test_url: str = "https://api.ipify.org",
+    timeout_s: float = 8.0,
+    parallel: int = 8,
+) -> dict[str, Any]:
+    """Probe every entry via tls_fetch-through-proxy + report rolling health.
+
+    NB: tls_fetch uses curl_cffi which only honors HTTP/HTTPS proxies, not
+    SOCKS5. SOCKS5 entries get a single connect-test instead.
+
+    Ex: proxy_pool_health_check() → {"checked":12,"alive":10,"results":[...]}"""
+    pool = _state.get("proxy_pool")
+    if pool is None or len(pool) == 0:
+        return _compact({"error": "pool empty"})
+
+    sem = asyncio.Semaphore(parallel)
+
+    async def _probe(entry: Any) -> dict[str, Any]:
+        async with sem:
+            ok = False
+            err = None
+            t0 = asyncio.get_event_loop().time()
+            try:
+                # Lazy import to avoid hard dep at module load.
+                from umbra.tls import tls_fetch  # type: ignore[attr-defined]
+                proxy_url = entry.chrome_flag_url()
+                if entry.username and entry.password:
+                    p = _up.urlparse(proxy_url)
+                    proxy_url = f"{p.scheme}://{entry.effective_username()}:{entry.password}@{p.hostname}:{p.port}"
+                resp = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        tls_fetch, test_url, proxy=proxy_url, timeout=timeout_s,
+                    ),
+                    timeout=timeout_s + 2.0,
+                )
+                ok = bool(resp and resp.get("status", 0) < 500)
+            except Exception as e:  # noqa: BLE001
+                err = str(e)[:120]
+            pool.report(entry.id, ok)
+            return {
+                "id": entry.id,
+                "url": entry.chrome_flag_url(),
+                "country": entry.country,
+                "ok": ok,
+                "ms": int((asyncio.get_event_loop().time() - t0) * 1000),
+                "error": err,
+            }
+
+    import urllib.parse as _up
+    results = await asyncio.gather(*[_probe(e) for e in pool.entries])
+    alive = sum(1 for r in results if r["ok"])
+    return _compact({
+        "checked": len(results),
+        "alive": alive,
+        "results": results,
+    })
+
+
+@mcp.tool()
+async def proxy_pool_export(redact: bool = False) -> dict[str, Any]:
+    """Dump pool state — round-trippable via proxy_pool_load(format='json').
+    redact=False (default) emits real creds; redact=True for safe sharing.
+
+    Ex: proxy_pool_export() → {"rotation":"...","entries":[{...creds...}]}"""
+    pool = _state.get("proxy_pool")
+    if pool is None:
+        return _compact({"rotation": None, "entries": []})
+    return _compact(pool.to_dict(redact=redact))
 
 
 @mcp.tool()
@@ -515,12 +741,16 @@ async def switch_tab(tab_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def navigate(tab_id: str, url: str) -> dict[str, Any]:
+async def navigate(tab_id: str, url: str, timeout_s: float = 30.0) -> dict[str, Any]:
     """Navigate tab. Stealth payload + cookies persist. Cheaper than spawn — default reflex.
 
+    timeout_s: hard cap on load (default 30s). Raises on timeout (tab survives, retry/abort).
     Ex: navigate('t0', 'https://example.com/login') → {"url":"..."}"""
     tab = _get_tab(tab_id)
-    await tab.get(url)
+    try:
+        await asyncio.wait_for(tab.get(url), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        return _compact({"url": url, "error": f"timeout after {timeout_s}s", "_timeout": True})
     return _compact({"url": url})
 
 
@@ -814,7 +1044,20 @@ async def dom_query(tab_id: str, selector: str, max_results: int = 30,
 async def upload_file(tab_id: str, selector: str, paths: list[str]) -> dict[str, Any]:
     """Set <input type=file>.files (skip OS picker). Paths absolute on server FS.
 
+    Security: if UMBRA_UPLOAD_ROOT env is set (colon-sep allowlist of dirs),
+    every path must resolve under one of those roots. Unset → no restriction
+    (legacy default; set the env in any agent-driven deployment).
     Ex: upload_file('t0', 'input[type=file]', ['/abs/img.png']) → {"ok":true}"""
+    allow = os.environ.get("UMBRA_UPLOAD_ROOT", "").strip()
+    if allow:
+        roots = [Path(r).resolve() for r in allow.split(":") if r]
+        for p in paths:
+            try:
+                rp = Path(p).resolve(strict=True)
+            except (OSError, RuntimeError) as e:
+                return _compact({"ok": False, "error": f"path {p!r}: {e}"})
+            if not any(rp == r or r in rp.parents for r in roots):
+                return _compact({"ok": False, "error": f"path {p!r} outside UMBRA_UPLOAD_ROOT"})
     ok = await tab_utils.upload_file(_get_tab(tab_id), selector, paths)
     return _compact({"ok": ok})
 

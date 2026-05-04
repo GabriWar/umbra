@@ -4,98 +4,68 @@
 
 # umbra
 
-> **The de-facto MCP server for stealth browser automation.**
-> Real Chrome, 0% creepjs detection, 31/31 sannysoft, 77 broad tools, multi-browser orchestration, encrypted sessions, prompt-injection signaling, and live human handoff over a Cloudflare tunnel — for AI agents that need to browse the web like a human, not a bot.
+> **Stealth Chrome MCP server for AI agents.**
+> Real Chrome • 31/31 sannysoft • 0% creepjs • 77 tools • multi-browser • proxy pools • encrypted sessions • live human handoff over Cloudflare tunnel.
 
 > *umbra — the darkest part of a shadow, where light is fully blocked.*
 
-Built by merging the best parts of [obscura](https://github.com/h4ckf0r0day/obscura) (per-session fingerprint payload) + [fantoma](https://github.com/Huzy85/fantoma) (zero-mouse ARIA driver) + [stealth-browser-mcp](https://github.com/vibheksoni/stealth-browser-mcp) (nodriver + MCP surface) — and filling in the gaps each one had: the [`Page.enable()` injection bug](https://github.com/GabriWar/umbra/blob/main/src/umbra/stealth/inject.py), real-GPU headless via `--headless=new + ANGLE Vulkan`, dynamic UA-CH version pinning, mDNS-aware WebRTC SDP filter, MCP token-efficient minification, and the `_untrusted: true` cognitive-separation flag on every page-sourced tool response.
+Built by merging the best parts of [obscura](https://github.com/h4ckf0r0day/obscura) (per-session fingerprint payload) + [fantoma](https://github.com/Huzy85/fantoma) (zero-mouse ARIA driver) + [stealth-browser-mcp](https://github.com/vibheksoni/stealth-browser-mcp) (nodriver + MCP surface) — and filling in their gaps: the [`Page.enable()` injection bug](https://github.com/GabriWar/umbra/blob/main/src/umbra/stealth/inject.py), real-GPU headless via `--headless=new + ANGLE Vulkan`, dynamic UA-CH version pinning, mDNS-aware WebRTC SDP filter, MCP token-efficient minification, and the `_untrusted: true` cognitive-separation flag on every page-sourced response.
 
 ---
 
-## 🪙 token efficiency
-
-Counter-intuitively, umbra costs LESS context than minimal browser-MCPs (incl. playwright-mcp) on any real agent session — its 77-tool catalog adds ~13KB upfront, but per-call savings recover that within 3 calls and dominate after that.
-
-**measured** (79-call e2e session against real Chrome + httpbin, all 77 tools exercised, see [`tests/test_token_audit.py`](https://github.com/GabriWar/umbra/blob/main/tests/test_token_audit.py)):
-
-| | uncompressed (`set_verbosity='full'`) | compressed (default) | saved |
-|---|---|---|---|
-| total tokens (cl100k_base) | 136,285 | **33,357** | **75 %** |
-| total bytes (JSON) | 420,648 | **71,282** | **83 %** |
-| median per call | — | **14 tokens / 4 ms** | — |
-
-Top per-tool wins: `clone_element` 97 %, `dom_query` 52 %, `tls_fetch` 40 %. The handful of zero-save tools (`screenshot*`, `aria_snapshot`, `inspect_element`) either ship base64 binaries (incompressible) or are already pre-RLE'd in the driver before `_compact` sees them.
-
-Per-call wins come from:
-- `extract_markdown` (clean MD via Mozilla Readability + markdownify) instead of raw HTML/innerText dumps
-- `_compact()` everywhere: drops `None` only, columnar layout for 4+ homogeneous arrays w/ constant-column hoisting, word-boundary truncation w/ explicit `...[+Nc, raise max_str to see full]` markers
-- `_untrusted: true` flag (8 bytes) instead of wrapping content in `<external>...</external>` tags
-- columnar `dom_query`: `{"keys":["text","href","rect"],"rows":[...]}` vs `[{text,href,rect,id,cls,value,visible},...]` — 44 % smaller on real pages
-- pagination markers (`{_truncated, shown, total, more_via}`) so callers see WHAT was truncated and HOW to lift the cap
-
-Toggle off via `set_verbosity('full')` when you need raw byte-exact output. Lossless: zero failures, zero inflations across all 79 audit calls.
-
----
-
-## ⚡ in numbers
+## ⚡ at a glance
 
 | | umbra |
 |---|---|
 | **bot.sannysoft.com** | **31 / 31** ✓ (perfect) |
 | **creepjs `headless`** | **0 %** (matches vanilla Chrome) |
 | **creepjs `stealth`** | **0 %** |
-| **CDP automation tells** stripped | `webdriver` `cdc_*` `$cdc_` `_phantom` `_selenium` `__webdriver_*` `__nightmare` ... |
-| **MCP tools** | **77** (broad primitives + `batch` flagship, not 95 narrow ones) |
 | **headless** | real GPU via `--headless=new + ANGLE Vulkan` (no SwiftShader tell) |
-| **TLS / JA3** | real Chrome stack + optional `curl_cffi` for raw HTTP |
+| **CDP automation tells** stripped | `webdriver` `cdc_*` `$cdc_` `_phantom` `_selenium` `__webdriver_*` `__nightmare` ... |
+| **TLS / JA3 / JA4** | real Chrome stack + optional `curl_cffi` for raw HTTP |
 | **WebRTC** | mDNS-aware SDP filter (real-Chrome behavior, no LAN IP leak) |
+| **MCP tools** | **77** — broad primitives + `batch` flagship + `proxy_pool_*` (not 95 narrow ones) |
+| **token efficiency** | **75% tokens / 83% bytes saved** vs raw output, [measured](#-token-efficiency) over 79 calls |
+| **proxy support** | pool w/ 5 rotation strategies, CDP auth (any provider), sticky sessions, geo filters |
 | **handoff** | live remote-view via `cloudflared` Quick Tunnel (works VPS → home laptop) |
 | **CDP schema drift** | resilient — survives Chrome field churn (e.g. dropped `sameParty`) without hangs |
 
 ---
 
-## 🚀 install
-
-**requirements:** Python 3.10+, a Chromium-based browser (Chrome / Chromium / Edge — auto-detected).
-
-### 1. clone + install
+## 🚀 quick start
 
 ```bash
 git clone https://github.com/GabriWar/umbra.git
 cd umbra
 pip install -e ".[all]"
+python -m umbra.server   # ctrl+c after a few seconds — verify tools register
 ```
 
-`[all]` pulls every optional dep — recommended. To pick & choose:
+**requirements:** Python 3.10+, a Chromium-based browser (Chrome / Chromium / Edge — auto-detected).
 
 | extra | enables | install |
 |---|---|---|
-| (default) | core 50 tools, encrypted sessions | `pip install -e .` |
+| (default) | core 50 tools, encrypted sessions, proxy pool | `pip install -e .` |
 | `[markdown]` | `extract_markdown` (readability + markdownify) | `pip install -e ".[markdown]"` |
 | `[tls]` | `tls_fetch` (curl_cffi w/ Chrome JA3+JA4) | `pip install -e ".[tls]"` |
 | `[playwright]` | optional Playwright backend | `pip install -e ".[playwright]"` |
 | `[test]` | pytest + asyncio for regression suite | `pip install -e ".[test]"` |
 | `[all]` | everything above | `pip install -e ".[all]"` |
 
-### 2. install cloudflared (recommended — for `handoff_*` tunnel)
-
-The handoff tool exposes a live remote-view of the headless browser via a Cloudflare Quick Tunnel — open a URL on any device, click I'M DONE when done. Without `cloudflared` it falls back to `http://127.0.0.1:PORT` (localhost only).
+**recommended companion: cloudflared** — `handoff_*` exposes a live remote-view of the browser via a Cloudflare Quick Tunnel (no signup, no auth). Without it, handoff falls back to localhost-only.
 
 ```bash
-# arch / cachyos
-sudo pacman -S cloudflared
-# debian / ubuntu
-sudo apt install cloudflared
-# macos
-brew install cloudflared
-# everywhere else: download the binary from
-#   https://github.com/cloudflare/cloudflared/releases/latest
+sudo pacman -S cloudflared       # arch / cachyos
+sudo apt install cloudflared     # debian / ubuntu
+brew install cloudflared         # macos
+# else: github.com/cloudflare/cloudflared/releases/latest
 ```
 
-No signup, no auth, no account.
+---
 
-### 3. wire into Claude Code (or any MCP client)
+## 🤖 MCP setup
+
+Wire into Claude Code (or any MCP client w/ the same shape):
 
 ```bash
 claude mcp add-json umbra '{
@@ -109,49 +79,131 @@ claude mcp add-json umbra '{
 }'
 ```
 
-Then restart Claude Code → `/mcp` should show `umbra` with 77 tools.
-
-For Cursor / Claude Desktop / other MCP clients, edit their `mcp_servers` config with the same shape.
-
-### 4. verify
-
-```bash
-python -m umbra.server  # ctrl+c after a few seconds — tools should register cleanly
-pytest -m e2e -v -s     # full regression suite (boots real Chrome, ~60s)
-```
-
-### TODO (distribution)
-
-- [ ] Submit to [Smithery.ai](https://smithery.ai) registry — add `smithery.yaml` and tag a release. Auto-indexes for Claude Desktop / Cursor / Cline users.
-- [ ] Add `.claude-plugin/plugin.json` for Claude Code's plugin marketplace system.
-- [ ] Optionally submit to Anthropic's official marketplace via `claude.ai/settings/plugins/submit`.
-
-### TODO (features)
-
-- [ ] **Proxy pool rotation** — currently `StealthOptions(proxy="...")` accepts one proxy per session. For high-volume scraping or geo-distributed scraping, add a `proxy_pool=[...]` option that round-robins (or rotates per-tab / per-N-requests / on-403). Pair w/ residential providers (smartproxy, iproyale, brightdata) for IP reputation. ~80 LoC + a per-tab proxy override via CDP `Network.setExtraHTTPHeaders` + `--proxy-server` per browser instance.
-
-- [x] **Full request interception graph** — shipped as `route_add` / `route_add_many` / `route_remove` / `route_set_enabled` / `route_block_set` / `route_list` / `route_captures` + `har_record_start/stop/dump/clear` + `har_replay_load`. Match DSL: `url_pattern`, `url_regex`, `method`, `resource_type`, `header_match`, `status_min/max`. Actions: `block` (14 custom `error_reason`s; response-stage block synthesizes 5xx via fulfill), `fulfill` (status+headers+body|body_b64), `continue` (request rewrite: new_url/new_method/new_post_data/headers — headers MERGED w/ originals, not replaced), `modify` (response-stage `getResponseBody` → `body_replace=[[regex,repl],...]` or outright body/status/headers override), `tee` (pure spy: pass-through + capture body), `redirect` (synth 302 + Location). Per-rule `delay_ms` (latency injection), `times` (auto-disable after N hits), `priority` (higher fires first), `capture` (per-rule cross-stage body buffer for any action), `enabled` (pause without remove). HAR-1.2 record/replay (`loose` URL-only mode for query-string drift). Tracker/resource blocking from `StealthOptions(block_trackers=, block_resources=)` integrated into the same engine — single Fetch handler, no double-fire race. `dynamic_hook` kept as legacy thin wrapper. Engine: `src/umbra/driver/intercept.py`.
-
-- [ ] **Battle-test the ARIA tree on edge cases** — fantoma-derived snapshot covers the 95% case (forms, lists, dialogs, nav) but real-world weirdness still exposes gaps: shadow-DOM-inside-iframe-inside-shadow-DOM, custom elements w/ delegated focus, `<canvas>`-rendered "trees" (Figma/Notion), virtual-scroll lists where ARIA indexes shift mid-snapshot, `aria-owns` cross-references, RTL/i18n role inflections. Need a regression corpus (gmail, github, notion, figma, linear, jira, gov forms) + property-based tests so we don't regress as nodriver/Chrome update. Playwright's accessibility tree has a decade of these baked in — ours is ~6 months.
-
-- [ ] **Network API ergonomics** — current `route_add(...)` is declarative (install rule, engine matches, dispatches). Playwright's `route(pattern, async (route, request) => { ... route.fulfill(...) })` is callback-based — caller writes a handler that decides per-request. More fluent for one-off conditional logic that would otherwise need 3+ rules. Add a `route_handler(tab_id, pattern, js_handler_src)` that lets the caller register a JS expression evaluated per paused request — returns `{action: 'fulfill'|'continue'|...}` per-call. Tradeoffs: sandbox the JS, network round-trip per request (slow), but unbeatable for "fulfill only if request body contains X" / "rewrite based on prior response" / dynamic decisions. Also: a Pythonic `@route('pattern')` decorator on the SDK side that compiles down to one or more rules.
-
-- [ ] **HAR tooling polish** — current HAR record/replay is HAR-1.2 byte-exact + has `loose` URL-only fallback. Playwright's HAR tooling has years of polish on top: per-entry **matchers** (`matchUrl(regex)`, `matchPostData(json_path)`, `matchHeaders(...)` for query-drift / session-token tolerance), **body morphing** helpers (`updateContent(transform)` to mutate a recorded body before serving, e.g. swap user IDs), **strict vs fallback** modes (strict = fail if no match, fallback = pass to network), **HAR sanitization** (strip Authorization/Cookie/Set-Cookie/PII before commit), and `Page.routeFromHAR(har, {url, notFound, update})` as a one-liner. Build: a `HarMatcher` dataclass + `har_replay_load(matchers=[...], on_miss='passthrough'|'block', sanitize=['authorization','cookie'])` + `har_dump(redact=[...])`. Unlocks committing HAR fixtures to test repos without leaking secrets.
+Restart Claude Code → `/mcp` shows `umbra` w/ 77 tools. For Cursor / Claude Desktop / Cline / others, edit their `mcp_servers` config with the same shape.
 
 ---
 
-## 🤖 use as an MCP server (the main use case)
+## 🎯 recipes
 
-```bash
-claude mcp add-json umbra '{
-  "type":"stdio",
-  "command":"/home/you/.venv/bin/python",
-  "args":["-m","umbra.server"],
-  "env":{"UMBRA_CONTAINER":"1","PYTHONPATH":"/path/to/umbra/src"}
-}'
+### `batch` ⭐ flagship — N tools in one MCP round-trip
+
+```python
+batch([
+  {"tool": "navigate",        "args": {"tab_id": "t0", "url": "https://news.ycombinator.com"}},
+  {"tool": "wait_for_text",   "args": {"tab_id": "t0", "text": "Hacker News"}},
+  {"tool": "aria_snapshot",   "args": {"tab_id": "t0"}},
+  {"tool": "extract_links",   "args": {"tab_id": "t0", "limit": 30}},
+  {"tool": "extract_markdown","args": {"tab_id": "t0"}},
+])
+# → {"results":[...5 entries with ok/data/ms each...],
+#    "elapsed_ms":1840, "ok_count":5, "fail_count":0}
 ```
 
-Now your agent has 77 MCP tools for stealth Chrome automation. Cursor, Claude Desktop, Claude Code — anything MCP.
+Serial in declared order, single MCP round-trip. Saves protocol framing per call AND composes with cross-call dedup (identical re-calls inside the batch return `_unchanged_since` instead of full payloads). Use it whenever you have ≥2 calls in mind — it's almost always the right choice.
+
+`stop_on_error=True` short-circuits on first failure (default: keep going + report fail_count).
+
+### `proxy_pool_*` — multi-provider rotation, any provider, any format
+
+5 rotation strategies, rolling health, geo + tag filters, sticky sessions. Plugs into `spawn(use_proxy_pool=True)` — picks one entry per browser process (Chrome locks proxy per-process; for parallel distinct egress IPs use multiple `browser_id`s).
+
+**input formats** — auto-detected, mix-and-match in same load:
+
+```text
+# standard URL (auth optional, scheme optional, defaults to http://)
+http://user:pass@gateway.provider.com:8080
+socks5://1.2.3.4:1080
+
+# provider IP-list export (host:port:user:pass — webshare, IPRoyal, Decodo, ...)
+31.59.20.176:6754:user:pass
+
+# sticky-session gateway (one URL, N session-suffixed users)
+gw.bright.com:22225:user-session-abc123-country-US:pass
+
+# inline metadata for filtering
+http://gw.proxy.com:8080#country=US,tags=residential|sticky
+```
+
+**rotation strategies** — `round_robin` (default), `random`, `least_used`, `best_health`, `sticky_browser` (same `browser_id` always gets same entry).
+
+**creds-stripped flag + CDP auth** — Chrome's `--proxy-server=` silently strips inline creds; umbra solves this by feeding Chrome a creds-free URL and answering proxy auth challenges via CDP `Fetch.authRequired`. Works for HTTP, HTTPS, SOCKS5 — Bright Data, Oxylabs, Smartproxy/Decodo, IPRoyal, SOAX, NetNut, Webshare, ProxyMesh, etc.
+
+```python
+# MCP usage
+proxy_pool_load(data="/path/to/proxies.txt", rotation="round_robin")
+proxy_pool_health_check(timeout_s=8.0, parallel=8)   # parallel probe, updates rolling health
+
+spawn(url="https://target.com", browser_id="us-1",
+      use_proxy_pool=True, proxy_country="US", proxy_tag="residential")
+# → {"tab_id":"t0", "proxy":{"id":"a3b1...", "host":"http://1.2.3.4:8080",
+#                            "country":"US", "tags":["residential"], "health":1.0}}
+
+proxy_pool_remove("a3b1...")   # bad rep? drop it
+```
+
+7 MCP tools: `proxy_pool_load`, `proxy_pool_add`, `proxy_pool_remove`, `proxy_pool_clear`, `proxy_pool_list`, `proxy_pool_health_check`, `proxy_pool_export`.
+
+### `handoff_start` — captcha / 2FA wall? hand the wheel back
+
+```
+agent → handoff_start("t0", "solve recaptcha")
+         → returns https://random.trycloudflare.com/h-XYZ/
+agent → tells user: "open this URL"
+user  → opens URL on phone/laptop, sees live page, clicks/types
+user  → hits "I'M DONE"
+agent → handoff_wait("t0")  blocks until done, returns post-handoff URL+title
+agent → continues automation
+```
+
+Built on Cloudflare Quick Tunnels (no signup, instant). URL contains a 192-bit auth token in the path → URL knowledge = auth. Forces HTTP/2 for sustained WebSocket reliability.
+
+### `extract_markdown` — page → clean markdown (firecrawl-style)
+
+```python
+extract_markdown('t0')
+# → {"_untrusted": True,
+#    "title": "Web Scraping - Wikipedia",
+#    "markdown": "# Web Scraping\n\nMethod of extracting data...",
+#    "source_html_len": 87432}
+```
+
+Mozilla Readability + markdownify. Falls back to `<body>` for list pages (HN, reddit) where readability gives up.
+
+### `session_save` / `session_load` — log in once, skip auth forever
+
+```python
+session_save('t0', 'github-me', passphrase='hunter2')
+# → encrypted blob in ~/.local/share/umbra/sessions/github.com/github-me.fern
+
+# Next time:
+session_load('t0', 'github-me', passphrase='hunter2')
+# → cookies + localStorage injected, you're logged in
+```
+
+Fernet (AES-128-CBC + HMAC-SHA256) + PBKDF2-HMAC-SHA256 200k iterations. Per-(domain, name) namespace, path-traversal-safe.
+
+### `tls_fetch` — skip the DOM entirely for JSON APIs
+
+```python
+tls_fetch('https://api.example.com/users')
+# → {"status": 200, "body": "{...}"}
+```
+
+curl_cffi pinned to running Chrome version — JA3+JA4+HTTP/2 SETTINGS frames match Chrome exactly. ~50ms vs ~500ms via spawn+navigate.
+
+### multi-browser orchestration
+
+```python
+spawn(url='...', browser_id='alice')
+spawn(url='...', browser_id='bob')
+# alice and bob have fully isolated cookies, profiles, identities
+list_browsers()
+# → [{"browser_id":"alice","tab_count":3}, {"browser_id":"bob","tab_count":1}]
+```
+
+### request interception graph (`route_*` + HAR record/replay)
+
+Match DSL: `url_pattern`, `url_regex`, `method`, `resource_type`, `header_match`, `status_min/max`. Actions: `block` (14 custom `error_reason`s; response-stage block synthesizes 5xx via fulfill), `fulfill` (status+headers+body|body_b64), `continue` (request rewrite: new_url/new_method/new_post_data/headers — headers MERGED w/ originals, not replaced), `modify` (response-stage `getResponseBody` → `body_replace=[[regex,repl],...]` or outright body/status/headers override), `tee` (pure spy: pass-through + capture body), `redirect` (synth 302 + Location). Per-rule `delay_ms` (latency injection), `times` (auto-disable after N hits), `priority` (higher fires first), `capture` (cross-stage body buffer for any action), `enabled` (pause without remove). HAR-1.2 record/replay (`loose` URL-only mode for query-string drift). Tracker/resource blocking from `StealthOptions(block_trackers=, block_resources=)` integrated into the same engine — single Fetch handler, no double-fire race. Engine: `src/umbra/driver/intercept.py`.
 
 ---
 
@@ -185,8 +237,17 @@ Now your agent has 77 MCP tools for stealth Chrome automation. Cursor, Claude De
                   ├─ network ctrl       block_urls / set_extra_headers / set_viewport /
                   │                     dynamic_hook
                   │
+                  ├─ interception       route_add / route_add_many / route_remove /
+                  │  (full graph)       route_set_enabled / route_block_set / route_list /
+                  │                     route_captures / har_record_start / har_record_stop /
+                  │                     har_dump / har_clear / har_replay_load
+                  │
+                  ├─ proxy pool ⭐      proxy_pool_load / proxy_pool_add / proxy_pool_remove /
+                  │  multi-provider     proxy_pool_clear / proxy_pool_list /
+                  │                     proxy_pool_health_check / proxy_pool_export
+                  │
                   ├─ handoff            handoff_start / handoff_wait / request_user_input
-                  │  (live remote view, cloudflared tunnel)
+                  │  (cloudflared)
                   │
                   ├─ sessions           session_save / session_load / session_list /
                   │  (encrypted)        session_delete
@@ -197,113 +258,6 @@ Now your agent has 77 MCP tools for stealth Chrome automation. Cursor, Claude De
                   │
                   └─ batch ⭐ flagship  batch  (N tools in one round-trip; composes w/ dedup)
 ```
-
----
-
-## 🎯 highlight tools
-
-### `batch` ⭐ flagship — N tools in one MCP round-trip
-
-```python
-batch([
-  {"tool": "navigate",        "args": {"tab_id": "t0", "url": "https://news.ycombinator.com"}},
-  {"tool": "wait_for_text",   "args": {"tab_id": "t0", "text": "Hacker News"}},
-  {"tool": "aria_snapshot",   "args": {"tab_id": "t0"}},
-  {"tool": "extract_links",   "args": {"tab_id": "t0", "limit": 30}},
-  {"tool": "extract_markdown","args": {"tab_id": "t0"}},
-])
-# → {"results":[...5 entries with ok/data/ms each...],
-#    "elapsed_ms":1840, "ok_count":5, "fail_count":0}
-```
-
-Serial in declared order, single MCP round-trip. Saves protocol framing per call AND composes with cross-call dedup (identical re-calls inside the batch return `_unchanged_since` instead of full payloads). Use it whenever you have ≥2 calls in mind — it's almost always the right choice.
-
-`stop_on_error=True` short-circuits the batch on first failure (default: keep going + report fail_count).
-
-### `handoff_start` — when you hit a captcha, hand the wheel back
-
-```
-agent → handoff_start("t0", "solve recaptcha")
-         → returns https://random.trycloudflare.com/h-XYZ/
-agent → tells user: "open this URL"
-user  → opens URL on phone/laptop, sees live page, clicks/types
-user  → hits "I'M DONE"
-agent → handoff_wait("t0")  blocks until done, returns post-handoff URL+title
-agent → continues automation
-```
-
-Built on Cloudflare Quick Tunnels (no signup, no auth, instant).
-URL contains a 192-bit auth token in the path → URL knowledge = auth.
-Forces HTTP/2 protocol for sustained WebSocket reliability.
-
-### `extract_markdown` — page → clean markdown (firecrawl-style)
-
-```python
-extract_markdown('t0')
-# → {"_untrusted": True,
-#    "title": "Web Scraping - Wikipedia",
-#    "markdown": "# Web Scraping\n\nMethod of extracting data...",
-#    "source_html_len": 87432}
-```
-
-Mozilla Readability + markdownify. Falls back to `<body>` for list pages (HN, reddit) where readability gives up.
-
-### `session_save` / `session_load` — log in once
-
-```python
-# First time: log in manually via handoff
-session_save('t0', 'github-me', passphrase='hunter2')
-# → encrypted blob in ~/.local/share/umbra/sessions/github.com/github-me.fern
-
-# Next time: skip login entirely
-session_load('t0', 'github-me', passphrase='hunter2')
-# → cookies + localStorage injected, you're logged in
-```
-
-Fernet (AES-128-CBC + HMAC-SHA256) + PBKDF2-HMAC-SHA256 200k iterations. Per-(domain, name) namespace, path-traversal-safe.
-
-### `tls_fetch` — skip the DOM entirely for JSON APIs
-
-```python
-tls_fetch('https://api.example.com/users')
-# → {"status": 200, "body": "{...}"}
-```
-
-curl_cffi pinned to the running Chrome version — JA3+JA4+HTTP/2 SETTINGS frames match Chrome exactly. ~50ms vs ~500ms via spawn+navigate.
-
-### multi-browser
-
-```python
-spawn(url='...', browser_id='alice')
-spawn(url='...', browser_id='bob')
-# alice and bob have fully isolated cookies, profiles, identities
-list_browsers()
-# → [{"browser_id":"alice","tab_count":3}, {"browser_id":"bob","tab_count":1}]
-```
-
----
-
-## 🛡️ stealth coverage matrix
-
-| detection vector | obscura | fantoma | sb-mcp | **umbra** |
-|---|---|---|---|---|
-| canvas / audio / WebGL fp | ✓ | partial | ✗ | ✓ (per-session noise, deterministic w/in session) |
-| `navigator.webdriver` | ✓ | ✓ | ✓ | ✓ |
-| `cdc_*` / `_phantom` / `_selenium` | ✗ | n/a | ✓ (nodriver) | ✓ delete-only (no `in` operator tell) |
-| `event.isTrusted` | ✗ | ✓ (no synth events) | ✗ | ✓ (CDP `Input.dispatch*` only) |
-| mouse / scroll behavioral fp | n/a | ✓ | ✗ | ✓ (ARIA driver default) |
-| keystroke timing fp | n/a | ✓ key-pair | ✗ flat 50ms | ✓ key-pair + log-normal jitter |
-| Cloudflare turnstile (passive) | ✗ | partial | ✓ | ✓ (real Chrome) |
-| TLS / JA3 / JA4 | ✗ | ✗ | ✓ (real Chrome) | ✓ + `tls_fetch` for raw HTTP |
-| WebGL real GPU in headless | ✗ no GL | ✗ | ✗ SwiftShader | ✓ ANGLE Vulkan |
-| WebRTC outgoing SDP `host` | partial | ✗ | ✗ | ✓ (mDNS-aware filter, real-Chrome behavior) |
-| UA-CH version mismatch | ✗ | ✗ | ✗ | ✓ (dynamic Chrome version + `setUserAgentOverride`) |
-| iframe + shadow DOM piercing | ✗ | ✓ | ✗ | ✓ |
-| tracker/fp-script blocking | ✓ (3520) | ✗ | ✗ | ✓ (3520 + dynamic hooks) |
-| session warming (cookie age) | ✗ | ✗ | ✗ | ✓ (4 profiles) |
-| live human handoff | ✗ | ✗ | ✗ | ✓ (cloudflared tunnel) |
-| MCP tool surface | ✗ | ✗ | ✓ (95 narrow) | ✓ (77 broad) |
-| prompt-injection signaling | ✗ | ✗ | ✗ | ✓ (`_untrusted: true` on all extraction) |
 
 ---
 
@@ -339,52 +293,79 @@ async with stealth_browser() as b:
     await drv.click(2)
 ```
 
+```python
+# Proxy pool — parallel browsers w/ distinct egress IPs
+from umbra import StealthBrowser, StealthOptions
+from umbra.proxypool import ProxyPool
+
+pool = ProxyPool(rotation="round_robin")
+pool.load_lines(open("proxies.txt").read())   # or load_json / load_csv / load_file
+
+async def main():
+    for i in range(3):
+        b = StealthBrowser(StealthOptions(proxy_pool=pool))
+        b._pool_browser_id = f"scraper-{i}"
+        async with b:
+            tab = await b.new_tab("https://api.ipify.org")
+            print(await tab.evaluate("document.body.innerText"))
+```
+
 ---
 
 ## 🔬 token efficiency
 
-every MCP tool response goes through `_compact()`:
+Counter-intuitively, umbra costs LESS context than minimal browser-MCPs (incl. playwright-mcp) on any real agent session — its 77-tool catalog adds ~13KB upfront, but per-call savings recover that within 3 calls and dominate after.
 
-- `None` dropped (empty `[]` / `""` / `0` / `False` KEPT — they're informative)
-- columnar layout for 4+ homogeneous-dict arrays: `{"_columnar":true,"keys":[...],"rows":[[...]]}`
-- constant-column hoist: shared values factored to `_constant: {col: val}`
-- word-boundary string truncation w/ explicit `...[+Nc, raise max_str to see full]` marker
-- list truncation w/ `{_truncated, shown, total, more_via}` marker
+**measured** (79-call e2e session against real Chrome + httpbin, all 77 tools exercised, see [`tests/test_token_audit.py`](https://github.com/GabriWar/umbra/blob/main/tests/test_token_audit.py)):
 
-**24% average wire-byte savings** on real-world pages (test data on HN/wikipedia). flip with `set_verbosity('full')` when you need raw.
+| | uncompressed (`set_verbosity='full'`) | compressed (default) | saved |
+|---|---|---|---|
+| total tokens (cl100k_base) | 136,285 | **33,357** | **75 %** |
+| total bytes (JSON) | 420,648 | **71,282** | **83 %** |
+| median per call | — | **14 tokens / 4 ms** | — |
 
-### cross-call dedup ledger
+Top per-tool wins: `clone_element` 97 %, `dom_query` 52 %, `tls_fetch` 40 %, `proxy_pool_export` 45 %. The handful of zero-save tools (`screenshot*`, `aria_snapshot`, `inspect_element`) either ship base64 binaries (incompressible) or are already pre-RLE'd in the driver before `_compact` sees them.
 
-Identical repeat calls return `{"_unchanged_since": "cN", "_hash": "..."}` instead of the full payload — the data is unchanged from call cN, so the agent reuses what it already has in context. Pass `force_refresh=True` to bypass.
+### how the savings happen
 
-```python
-extract_text('t0')   # → call c5: full {text:"...",length:8421,...}
-extract_text('t0')   # → call c6: {"_unchanged_since":"c5","_hash":"a7f2..."}  ← saved 8KB
-```
+Every MCP tool response goes through `_compact()`:
 
-Pairs perfectly with `batch` — you can blast `[snapshot, snapshot, snapshot]` after each interaction; only the deltas come back.
+- **drops `None` only** — empty `[]` / `""` / `0` / `False` KEPT (they're informative)
+- **columnar layout** for 4+ homogeneous-dict arrays: `{"_columnar":true,"keys":[...],"rows":[[...]]}` — 44% smaller on real `dom_query`/cookies/network
+- **constant-column hoist** — shared values factored to `_constant: {col: val}`
+- **word-boundary string truncation** w/ explicit `...[+Nc, raise max_str to see full]` marker
+- **list truncation** w/ `{_truncated, shown, total, more_via}` marker — caller sees what was cut and how to lift the cap
+- **`_untrusted: true` flag** (8 bytes) instead of wrapping content in `<external>...</external>` tags
+- **cross-call dedup ledger** — identical repeat calls return `{"_unchanged_since": "cN", "_hash": "..."}` instead of full payload (`force_refresh=True` to bypass)
+- **ARIA pattern grouping (RLE)** — long lists w/ repeating `(role,name)` cycles collapse to a single `[range] cycle×N (period P): ...` line. Real HN comments page: ~70% smaller snapshot.
+- **URL footnoting in `extract_links`** — repeated hosts factored to `_hosts: {h1: "https://..."}` then referenced. ~50% smaller on link-heavy pages.
 
-### ARIA pattern grouping (RLE for snapshots)
+Toggle off via `set_verbosity('full')` when you need raw byte-exact output. Lossless: zero failures, zero inflations across all 79 audit calls.
 
-Long lists (HN comments, search results, file trees) with repeating `(role, name)` cycles get run-length-encoded losslessly:
+---
 
-```
-[12-77] cycle×13 (period 5): link("Comments"), link("Permalink"), link("Save"), button("Vote"), text("user")
-↳ 66 lines collapsed into 1 — agent still knows the exact range and what's in each cycle
-```
+## 🛡️ stealth coverage matrix
 
-Detects period 1–6 with ≥2 reps. Real HN comments page: ~70% smaller snapshot.
-
-### URL footnoting (host dedup in `extract_links`)
-
-Repeated hosts get factored out once:
-
-```
-{"_hosts": {"h1":"https://github.com", "h2":"https://news.ycombinator.com"},
- "links": [["h1","/user/foo"], ["h1","/issues/123"], ["h2","/item?id=456"], ...]}
-```
-
-~50% smaller on link-heavy pages. Reconstruct via `_hosts[h] + path`.
+| detection vector | obscura | fantoma | sb-mcp | **umbra** |
+|---|---|---|---|---|
+| canvas / audio / WebGL fp | ✓ | partial | ✗ | ✓ (per-session noise, deterministic w/in session) |
+| `navigator.webdriver` | ✓ | ✓ | ✓ | ✓ |
+| `cdc_*` / `_phantom` / `_selenium` | ✗ | n/a | ✓ (nodriver) | ✓ delete-only (no `in` operator tell) |
+| `event.isTrusted` | ✗ | ✓ (no synth events) | ✗ | ✓ (CDP `Input.dispatch*` only) |
+| mouse / scroll behavioral fp | n/a | ✓ | ✗ | ✓ (ARIA driver default) |
+| keystroke timing fp | n/a | ✓ key-pair | ✗ flat 50ms | ✓ key-pair + log-normal jitter |
+| Cloudflare turnstile (passive) | ✗ | partial | ✓ | ✓ (real Chrome) |
+| TLS / JA3 / JA4 | ✗ | ✗ | ✓ (real Chrome) | ✓ + `tls_fetch` for raw HTTP |
+| WebGL real GPU in headless | ✗ no GL | ✗ | ✗ SwiftShader | ✓ ANGLE Vulkan |
+| WebRTC outgoing SDP `host` | partial | ✗ | ✗ | ✓ (mDNS-aware filter, real-Chrome behavior) |
+| UA-CH version mismatch | ✗ | ✗ | ✗ | ✓ (dynamic Chrome version + `setUserAgentOverride`) |
+| iframe + shadow DOM piercing | ✗ | ✓ | ✗ | ✓ |
+| tracker/fp-script blocking | ✓ (3520) | ✗ | ✗ | ✓ (3520 + dynamic hooks) |
+| session warming (cookie age) | ✗ | ✗ | ✗ | ✓ (4 profiles) |
+| live human handoff | ✗ | ✗ | ✗ | ✓ (cloudflared tunnel) |
+| proxy auth (CDP, any provider) | ✗ | ✗ | ✗ | ✓ + 5-strategy rotation pool |
+| MCP tool surface | ✗ | ✗ | ✓ (95 narrow) | ✓ (77 broad) |
+| prompt-injection signaling | ✗ | ✗ | ✗ | ✓ (`_untrusted: true` on all extraction) |
 
 ---
 
@@ -406,20 +387,22 @@ Patches are **idempotent** (per-class flag + module-level short-circuit, safe to
 
 ```
                   ┌────────────────────────────────────────────┐
-                  │  FastMCP server  (umbra.server, 65 tools)  │
+                  │  FastMCP server  (umbra.server, 77 tools)  │
                   │  + _compact() minification                 │
                   │  + _untrusted prompt-injection signaling   │
+                  │  + cross-call dedup ledger                 │
                   └────────────────────────────────────────────┘
                                        │
-       ┌─────────────────────┬─────────┴──────────┬─────────────────────┐
-       ▼                     ▼                    ▼                     ▼
-  ┌─────────┐          ┌──────────┐         ┌────────────┐        ┌──────────┐
-  │ Browser │          │  Drivers │         │  Stealth   │        │  Misc    │
-  │  multi  │          │  ARIA    │         │  payload   │        │  session │
-  │  inst.  │          │  CDP     │         │  3520 list │        │  handoff │
-  └────┬────┘          │ humanizer│         │  detection │        │    tls   │
-       │               └────┬─────┘         └─────┬──────┘        └──────────┘
-       ▼                    ▼                     ▼
+       ┌────────────┬──────────────────┼──────────────┬──────────────┐
+       ▼            ▼                  ▼              ▼              ▼
+  ┌─────────┐  ┌──────────┐      ┌────────────┐  ┌──────────┐  ┌──────────┐
+  │ Browser │  │  Drivers │      │  Stealth   │  │  Proxy   │  │  Misc    │
+  │  multi  │  │  ARIA    │      │  payload   │  │  pool    │  │  session │
+  │  inst.  │  │  CDP     │      │  3520 list │  │  CDP auth│  │  handoff │
+  └────┬────┘  │ humanizer│      │  detection │  │  rotation│  │    tls   │
+       │       │ intercept│      └─────┬──────┘  └────┬─────┘  └──────────┘
+       │       └────┬─────┘            │              │
+       ▼            ▼                  ▼              ▼
   ┌──────────────────────────────────────────────────────────────────────┐
   │nodriver (real Chrome via CDP) + Page.addScriptToEvaluateOnNewDocument│
   │  --headless=new + --use-angle=vulkan + dynamic UA-CH version pinning │
@@ -438,10 +421,32 @@ Patches are **idempotent** (per-class flag + module-level short-circuit, safe to
 
 ```bash
 pip install -e ".[test]"
-pytest -m e2e -v -s
+pytest -m e2e -v -s                                      # full e2e
+.venv/bin/python tests/test_token_audit.py               # token efficiency audit (79 calls)
+UMBRA_PROXY_LIST=/path/to/proxies.txt \                  # opt-in: also exercise proxy pool
+  .venv/bin/python tests/test_token_audit.py
 ```
 
-runs `bot.sannysoft.com` + `creepjs` + UA-CH consistency + automation-tell checks. Catches drift if Chrome / nodriver update breaks something.
+Covers `bot.sannysoft.com` + `creepjs` + UA-CH consistency + automation-tell checks + (when enabled) end-to-end proxy pool spawn/auth/rotation. Catches drift if Chrome / nodriver update breaks something.
+
+---
+
+## 🛠️ roadmap
+
+### distribution
+
+- [ ] Submit to [Smithery.ai](https://smithery.ai) registry — add `smithery.yaml` + tag a release. Auto-indexes for Claude Desktop / Cursor / Cline users.
+- [ ] Add `.claude-plugin/plugin.json` for Claude Code's plugin marketplace.
+- [ ] Submit to Anthropic's official marketplace via `claude.ai/settings/plugins/submit`.
+
+### features
+
+- [x] **Proxy pool rotation** — shipped. `ProxyPool` w/ 5 rotation strategies, rolling health, geo + tag filters, sticky sessions, multi-format loaders (URL, `host:port:user:pass`, sticky-session gateway, JSON, CSV). CDP `Fetch.authRequired` handler so creds work on any provider despite Chrome's flag stripping. 7 MCP tools.
+- [x] **Full request interception graph** — shipped as `route_*` + `har_*` (see recipes section).
+- [ ] **Battle-test the ARIA tree on edge cases** — fantoma-derived snapshot covers the 95% case (forms, lists, dialogs, nav) but real-world weirdness still exposes gaps: shadow-DOM-inside-iframe-inside-shadow-DOM, custom elements w/ delegated focus, `<canvas>`-rendered "trees" (Figma/Notion), virtual-scroll lists where ARIA indexes shift mid-snapshot, `aria-owns` cross-references, RTL/i18n role inflections. Need a regression corpus (gmail, github, notion, figma, linear, jira, gov forms) + property-based tests.
+- [ ] **Network API ergonomics** — current `route_add(...)` is declarative; Playwright's `route(pattern, async (route, request) => {...})` is callback-based. Add `route_handler(tab_id, pattern, js_handler_src)` that lets the caller register a JS expression evaluated per paused request — returns `{action: 'fulfill'|'continue'|...}` per-call. Tradeoffs: sandbox the JS, network round-trip per request (slow), but unbeatable for "fulfill only if request body contains X" / "rewrite based on prior response" / dynamic decisions.
+- [ ] **HAR tooling polish** — current HAR record/replay is HAR-1.2 byte-exact + `loose` URL-only fallback. Add per-entry **matchers** (`matchUrl(regex)`, `matchPostData(json_path)`, `matchHeaders(...)` for query-drift / session-token tolerance), **body morphing** (`updateContent(transform)` to mutate a recorded body before serving), **strict vs fallback** modes, **HAR sanitization** (strip Authorization/Cookie/Set-Cookie/PII before commit). Unlocks committing HAR fixtures to test repos without leaking secrets.
+- [ ] **Per-browser exit-node selection via Tailscale** — userspace `tailscaled` per-browser w/ distinct exit nodes for self-hosted residential proxy farms (alternative to paid providers).
 
 ---
 

@@ -228,6 +228,14 @@ class StealthOptions:
     block_trackers: bool = True
     block_resources: tuple[str, ...] = ()  # e.g. ("Image", "Media", "Font") for fast scraping
 
+    # Proxy pool — when set, takes precedence over `proxy`. Pool picks one
+    # entry per browser; creds (if any) are wired via CDP Fetch.authRequired
+    # (Chrome's --proxy-server flag strips inline auth, so we can't put them
+    # in the URL).
+    proxy_pool: Any = None         # ProxyPool | None — Any to avoid import cycle
+    proxy_country: str | None = None  # ISO-3166 alpha-2 filter when picking
+    proxy_tag: str | None = None      # tag filter (e.g. "residential")
+
     # Stealth payload mode:
     #   "minimal" (default) → only fix automation tells, mimic vanilla Chrome.
     #     Best for production bot evasion (CF, DataDome, creepjs ~0%/0%).
@@ -265,6 +273,10 @@ class StealthBrowser:
         self._chrome_version: str | None = None
         self._ua: str | None = None
         self._ua_meta: dict[str, Any] | None = None
+        # Proxy-pool plumbing — populated in start() when options.proxy_pool set.
+        self._pool_browser_id: str | None = None
+        self._pool_entry: Any = None      # ProxyEntry held for this session
+        self._proxy_creds: tuple[str, str] | None = None  # (user, pass) for CDP auth
 
     @property
     def browser(self) -> uc.Browser:
@@ -320,8 +332,32 @@ class StealthBrowser:
             log.info("LD_PRELOAD shim: %s", opts.ld_preload_shim)
         if opts.locale:
             flags.append(f"--lang={opts.locale}")
-        if opts.proxy:
+        # Proxy: pool wins over single-proxy. Pool gives us a creds-stripped
+        # URL for the flag (Chrome strips inline auth anyway) + a (user, pass)
+        # tuple we install via CDP Fetch.authRequired in _configure_tab.
+        if opts.proxy_pool is not None:
+            bid = self._pool_browser_id or f"sb-{id(self):x}"
+            self._pool_browser_id = bid
+            entry = await opts.proxy_pool.acquire(
+                bid, country=opts.proxy_country, tag=opts.proxy_tag,
+            )
+            self._pool_entry = entry
+            flags.append(f"--proxy-server={entry.chrome_flag_url()}")
+            user = entry.effective_username()
+            if user and entry.password:
+                self._proxy_creds = (user, entry.password)
+            log.info("proxy pool acquired entry %s (country=%s)",
+                     entry.id, entry.country or "?")
+        elif opts.proxy:
             flags.append(f"--proxy-server={opts.proxy}")
+            # If single-proxy URL has inline auth, extract for CDP install.
+            try:
+                import urllib.parse as _up_local
+                p = _up_local.urlparse(opts.proxy)
+                if p.username and p.password:
+                    self._proxy_creds = (p.username, p.password)
+            except Exception:  # noqa: BLE001
+                pass
         if opts.window_size:
             w, h = opts.window_size
             flags.append(f"--window-size={w},{h}")
@@ -343,6 +379,14 @@ class StealthBrowser:
         )
         log.info("Launching Chrome (headless=%s, args=%d)", opts.headless, len(flags))
         self._browser = await uc.start(config=config)
+        # nodriver auto-creates a temp profile when user_data_dir=None and
+        # KILLS the chrome process on stop() but never rmtrees it (see
+        # nodriver/core/browser.py:667). Track so we can clean on stop().
+        self._owned_profile_dir: str | None = None
+        if not opts.user_data_dir:
+            with contextlib.suppress(Exception):
+                if not config.uses_custom_data_dir:
+                    self._owned_profile_dir = config.user_data_dir
         # Install stealth on the default tab opened at launch. Subsequent
         # navigations on this tab will re-run the payload (CDP guarantees that
         # for addScriptToEvaluateOnNewDocument).
@@ -406,7 +450,9 @@ class StealthBrowser:
                     headers=cdp.network.Headers({"Accept-Language": opts.accept_languages})
                 ))
 
-        if opts.block_trackers or opts.block_resources:
+        # Wire Fetch domain if either blocking is on OR we have proxy creds
+        # to answer (auth challenges fire on the same domain).
+        if opts.block_trackers or opts.block_resources or self._proxy_creds:
             await self._wire_blocking(tab)
 
         # Console + network buffers — populated by event handlers, drained
@@ -458,9 +504,33 @@ class StealthBrowser:
             tab.add_handler(cdp.network.RequestWillBeSent, on_request)
 
     async def _wire_blocking(self, tab: Any) -> None:
-        """Enable Fetch.enable interception and drop tracker / blocked-type requests."""
+        """Enable Fetch.enable interception and drop tracker / blocked-type requests.
+
+        Also handles proxy auth challenges via the same Fetch domain — we
+        only enable handle_auth_requests when proxy creds are set, so the
+        no-proxy hot path stays event-cheap.
+        """
         cdp = uc.cdp
-        await tab.send(cdp.fetch.enable())
+        creds = self._proxy_creds
+
+        # Register handlers BEFORE Fetch.enable, otherwise the first events
+        # fire while we're mid-await and get dropped → tab hangs on chrome
+        # error w/ no auth challenge ever delivered.
+        if creds:
+            user, pwd = creds
+
+            async def _on_auth(event: Any) -> None:
+                try:
+                    await tab.send(cdp.fetch.continue_with_auth(
+                        request_id=event.request_id,
+                        auth_challenge_response=cdp.fetch.AuthChallengeResponse(
+                            response="ProvideCredentials", username=user, password=pwd,
+                        ),
+                    ))
+                except Exception as e:  # noqa: BLE001
+                    log.warning("auth response failed: %s", e)
+
+            tab.add_handler(cdp.fetch.AuthRequired, _on_auth)
 
         block_types = {t.lower() for t in self.options.block_resources}
         check_trackers = self.options.block_trackers
@@ -491,14 +561,31 @@ class StealthBrowser:
                 log.debug("fetch handler error: %s", e)
 
         tab.add_handler(cdp.fetch.RequestPaused, _on_request)
+        # Enable AFTER all handlers are registered — early events would be
+        # dropped otherwise (chrome-error on first navigation).
+        await tab.send(cdp.fetch.enable(handle_auth_requests=bool(creds)))
 
     async def stop(self) -> None:
         """Stop the browser process."""
+        # Release proxy-pool binding before tearing down (so the entry is
+        # immediately re-pickable for the next browser).
+        if self._pool_entry is not None and self.options.proxy_pool is not None:
+            with contextlib.suppress(Exception):
+                await self.options.proxy_pool.release(self._pool_browser_id or "")
+            self._pool_entry = None
+            self._proxy_creds = None
         if self._browser is not None:
             with contextlib.suppress(Exception):
                 self._browser.stop()
             self._browser = None
             self._tabs.clear()
+        # rmtree nodriver-created temp profile (it doesn't, see start()).
+        owned = getattr(self, "_owned_profile_dir", None)
+        if owned:
+            import shutil
+            with contextlib.suppress(Exception):
+                shutil.rmtree(owned, ignore_errors=True)
+            self._owned_profile_dir = None
         # Restore monkey-patched spawner so other code in this process gets
         # vanilla asyncio behavior again.
         if hasattr(self, "_orig_subprocess_spawner"):

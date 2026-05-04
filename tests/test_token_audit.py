@@ -102,6 +102,7 @@ async def t(label, coro, *, expect_ok=True):
     RESULTS.append(row)
     status = "PASS" if ok else "FAIL"
     print(f"  {status:4s} [{ms:5d}ms full={row['full_tokens']:5d}t cmp={row['cmp_tokens']:5d}t saved={row['saved_pct']:3d}%] {label}", flush=True)
+    return result
     if err:
         print(f"    ERR: {err}", flush=True)
 
@@ -228,9 +229,24 @@ async def main():
 
     # ─── J. files ──────────────────────────────────────────────────────
     print("\n--- J. files/net ---", flush=True)
-    await t("setup_downloads", lambda: call("setup_downloads", tab_id="t0", download_dir="/tmp/umbra_dl_audit"))
-    await t("wait_for_download(timeout)", lambda: call("wait_for_download", tab_id="t0",
-                                                        download_dir="/tmp/umbra_dl_audit", timeout_s=1))
+    import shutil
+    dl_dir = "/tmp/umbra_dl_audit"
+    shutil.rmtree(dl_dir, ignore_errors=True)
+    await t("setup_downloads", lambda: call("setup_downloads", tab_id="t0", download_dir=dl_dir))
+    # Real download: synthesize an <a download> w/ a data: URL and click it.
+    # Triggers Chrome's download flow → wait_for_download should resolve fast.
+    await t("evaluate(trigger download)", lambda: call("evaluate", tab_id="t0", expression="""
+        (() => {
+          const a = document.createElement('a');
+          a.href = 'data:text/plain;base64,' + btoa('umbra audit ' + Date.now());
+          a.download = 'umbra-audit.txt';
+          document.body.appendChild(a);
+          a.click();
+          return true;
+        })()
+    """))
+    await t("wait_for_download(real)", lambda: call("wait_for_download", tab_id="t0",
+                                                     download_dir=dl_dir, timeout_s=10))
     await t("block_urls", lambda: call("block_urls", tab_id="t0", patterns=["*ads*"]))
     await t("set_extra_headers", lambda: call("set_extra_headers", tab_id="t0", headers={"X-A": "1"}))
     await t("set_viewport", lambda: call("set_viewport", tab_id="t0", width=1280, height=720))
@@ -262,6 +278,50 @@ async def main():
         {"tool": "evaluate", "args": {"tab_id": "t0", "expression": "document.title"}},
         {"tool": "memory_metrics", "args": {"tab_id": "t0", "force_refresh": True}},
     ]))
+
+    # ─── O. proxy pool (opt-in via UMBRA_PROXY_LIST) ───────────────────
+    # Set UMBRA_PROXY_LIST to either a file path (one proxy per line) OR an
+    # inline `;`-separated list of URLs. Skipped when unset so CI w/o proxy
+    # creds still passes. Each format supported: standard URL, host:port:user:pass,
+    # gateway:port:user-N:pass.
+    proxy_src = os.environ.get("UMBRA_PROXY_LIST", "").strip()
+    if proxy_src:
+        print("\n--- O. proxy pool (opt-in) ---", flush=True)
+        proxy_data = (
+            Path(proxy_src).read_text() if Path(proxy_src).exists()
+            else proxy_src.replace(";", "\n")
+        )
+        await t("proxy_pool_load",
+                lambda: call("proxy_pool_load", data=proxy_data, format="lines"))
+        await t("proxy_pool_list", lambda: call("proxy_pool_list"))
+        added = await t("proxy_pool_add(extra)", lambda: call(
+            "proxy_pool_add", url="http://example.invalid:9999",
+            username="probe", password="probe", country="ZZ", tags=["ephemeral"],
+        ))
+        await t("proxy_pool_health_check",
+                lambda: call("proxy_pool_health_check", timeout_s=6.0, parallel=4))
+        # End-to-end: spawn a browser through the pool, navigate, verify egress.
+        spawn_res = await t("spawn(via pool)", lambda: call(
+            "spawn", url="https://api.ipify.org",
+            browser_id="proxy-audit", use_proxy_pool=True,
+        ))
+        proxy_tab_id = (spawn_res or {}).get("tab_id") if isinstance(spawn_res, dict) else None
+        await asyncio.sleep(2)
+        if proxy_tab_id:
+            await t("extract_text(egress IP)", lambda: call(
+                "extract_text", tab_id=proxy_tab_id, selector="body",
+            ))
+        await t("close_browser(proxy-audit)",
+                lambda: call("close_browser", browser_id="proxy-audit"))
+        await t("proxy_pool_export(redacted)",
+                lambda: call("proxy_pool_export", redact=True))
+        # Drop the example.invalid we added — verify remove uses the id we got back.
+        rm_id = (added or {}).get("id") if isinstance(added, dict) else None
+        if rm_id:
+            await t("proxy_pool_remove", lambda: call("proxy_pool_remove", entry_id=rm_id))
+        await t("proxy_pool_clear", lambda: call("proxy_pool_clear"))
+    else:
+        print("\n--- O. proxy pool: SKIPPED (set UMBRA_PROXY_LIST to enable) ---", flush=True)
 
     # ─── teardown ──────────────────────────────────────────────────────
     print("\n--- teardown ---", flush=True)
