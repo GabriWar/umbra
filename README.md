@@ -126,7 +126,18 @@ http://gw.proxy.com:8080#country=US,tags=residential|sticky
 
 **rotation strategies** — `round_robin` (default), `random`, `least_used`, `best_health`, `sticky_browser` (same `browser_id` always gets same entry).
 
-**creds-stripped flag + CDP auth** — Chrome's `--proxy-server=` silently strips inline creds; umbra solves this by feeding Chrome a creds-free URL and answering proxy auth challenges via CDP `Fetch.authRequired`. Works for HTTP, HTTPS, SOCKS5 — Bright Data, Oxylabs, Smartproxy/Decodo, IPRoyal, SOAX, NetNut, Webshare, ProxyMesh, etc.
+**creds-stripped flag + CDP auth** — Chrome's `--proxy-server=` silently strips inline creds; umbra feeds Chrome a creds-free URL and answers proxy auth challenges via CDP `Fetch.authRequired`. Works for HTTP / HTTPS proxies w/ Basic auth — Bright Data, Oxylabs, Smartproxy/Decodo, IPRoyal, SOAX, NetNut, Webshare, ProxyMesh, etc.
+
+**SOCKS5 + auth caveat** — Chromium has no support for SOCKS5 username/password auth (RFC 1929) — [open since 2014, effectively wontfix](https://issues.chromium.org/issues/40089088). CDP `Fetch.authRequired` is HTTP-layer only; SOCKS5 auth is a TCP-subnegotiation that completes BEFORE any HTTP fires, so the Fetch domain never sees it. Workaround matrix:
+
+| transport | auth | works in umbra? |
+|---|---|---|
+| `http://host:port` | none | ✓ |
+| `http://user:pass@host:port` | basic | ✓ (via CDP) |
+| `socks5://host:port` | none | ✓ |
+| `socks5://user:pass@host:port` | RFC 1929 | ✗ — unfixable in chrome |
+
+If u need SOCKS5 + auth, run a local HTTP→SOCKS5 forwarder (`gost -L=http://:8080 -F=socks5://user:pass@upstream`) and point umbra at the local HTTP port instead.
 
 ```python
 # MCP usage
