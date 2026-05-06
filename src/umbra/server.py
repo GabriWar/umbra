@@ -38,9 +38,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import glob
 import json
 import logging
 import os
+import secrets
+import shutil
+import signal
+import subprocess
+import time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -350,10 +356,18 @@ async def _get_or_create_browser(browser_id: str | None,
     return browser_id, _state["browsers"][browser_id]
 
 
+def _touch(tab_id: str) -> None:
+    """Mark tab as recently used so the idle GC won't reap it."""
+    entry = _state["tabs"].get(tab_id)
+    if entry is not None:
+        entry["last_used_at"] = time.time()
+
+
 def _get_tab(tab_id: str) -> Any:
     entry = _state["tabs"].get(tab_id)
     if entry is None:
         raise ValueError(f"unknown tab_id {tab_id!r} — call spawn first")
+    entry["last_used_at"] = time.time()
     return entry["tab"]
 
 
@@ -381,6 +395,7 @@ def _get_aria(tab_id: str) -> AriaDriver:
     entry = _state["tabs"].get(tab_id)
     if entry is None:
         raise ValueError(f"unknown tab_id {tab_id!r}")
+    entry["last_used_at"] = time.time()
     return entry["driver"]
 
 
@@ -435,7 +450,11 @@ async def spawn(
     n = _state["next_tab_n"]
     _state["next_tab_n"] = n + 1
     tab_id = f"t{n}"
-    _state["tabs"][tab_id] = {"browser_id": bid, "tab": tab, "driver": AriaDriver(tab)}
+    _now = time.time()
+    _state["tabs"][tab_id] = {
+        "browser_id": bid, "tab": tab, "driver": AriaDriver(tab),
+        "created_at": _now, "last_used_at": _now,
+    }
     out: dict[str, Any] = {"tab_id": tab_id, "browser_id": bid, "url": url}
     if browser._pool_entry is not None:
         e = browser._pool_entry
@@ -1964,19 +1983,520 @@ async def batch(
 # Server entrypoint
 # ═════════════════════════════════════════════════════════════════════════
 
+# ═════════════════════════════════════════════════════════════════════════
+# Stale-process cleanup
+# ═════════════════════════════════════════════════════════════════════════
+
+_UC_PROFILE_GLOB = "/tmp/uc_*"
+
+
+async def _close_tab_internal(tab_id: str) -> bool:
+    """Close one tab + drop its registry entry. Used by idle GC."""
+    entry = _state["tabs"].pop(tab_id, None)
+    if entry is None:
+        return False
+    tab = entry["tab"]
+    with __import__("contextlib").suppress(Exception):
+        await tab.close()
+    _state.get("routes", {}).pop(tab_id, None)
+    _state.get("hooks", {}).pop(tab_id, None)
+    return True
+
+
+async def _close_browser_internal(browser_id: str) -> bool:
+    browser = _state["browsers"].pop(browser_id, None)
+    if browser is None:
+        return False
+    for tid, entry in list(_state["tabs"].items()):
+        if entry["browser_id"] == browser_id:
+            _state["tabs"].pop(tid, None)
+    with __import__("contextlib").suppress(Exception):
+        await browser.stop()
+    return True
+
+
+async def cleanup_stale_internal(idle_seconds: float) -> dict[str, Any]:
+    """Reap idle tabs + browsers with no live tabs. Pure async, no MCP wrapper."""
+    now = time.time()
+    closed_tabs: list[str] = []
+    for tid, entry in list(_state["tabs"].items()):
+        last = entry.get("last_used_at", entry.get("created_at", now))
+        if now - last >= idle_seconds:
+            if await _close_tab_internal(tid):
+                closed_tabs.append(tid)
+    closed_browsers: list[str] = []
+    for bid in list(_state["browsers"].keys()):
+        has_tabs = any(e["browser_id"] == bid for e in _state["tabs"].values())
+        if not has_tabs:
+            if await _close_browser_internal(bid):
+                closed_browsers.append(bid)
+    return {"closed_tabs": closed_tabs, "closed_browsers": closed_browsers,
+            "idle_seconds": idle_seconds}
+
+
+def _kill_orphan_chromes() -> dict[str, Any]:
+    """Kill leftover Chrome procs from prior umbra-server runs + rmtree their profile dirs.
+
+    Identifies by `--user-data-dir=/tmp/uc_*` flag in the cmdline. Only touches
+    chromes whose parent isn't this process (so we don't murder our own browsers).
+    """
+    killed_pids: list[int] = []
+    removed_dirs: list[str] = []
+    my_pid = os.getpid()
+
+    # 1. find chrome procs with uc-style profile dirs
+    try:
+        ps = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,cmd="],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except Exception:
+        ps = None
+
+    in_use_dirs: set[str] = set()
+    if ps and ps.returncode == 0:
+        for line in ps.stdout.splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) < 3:
+                continue
+            try:
+                pid, ppid = int(parts[0]), int(parts[1])
+            except ValueError:
+                continue
+            cmd = parts[2]
+            if "--user-data-dir=/tmp/uc_" not in cmd:
+                continue
+            # Extract the dir
+            for tok in cmd.split():
+                if tok.startswith("--user-data-dir=/tmp/uc_"):
+                    udir = tok.split("=", 1)[1]
+                    if ppid == my_pid:
+                        # Owned by us — don't kill, but remember it's in use
+                        in_use_dirs.add(udir)
+                    else:
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                            killed_pids.append(pid)
+                        except ProcessLookupError:
+                            pass
+                        except PermissionError:
+                            pass
+                    break
+
+    # Give SIGTERM a moment to land before sweeping dirs
+    if killed_pids:
+        time.sleep(0.5)
+
+    # 2. rmtree any uc_* profile dirs not currently in use by a live chrome
+    for udir in glob.glob(_UC_PROFILE_GLOB):
+        if udir in in_use_dirs:
+            continue
+        try:
+            shutil.rmtree(udir, ignore_errors=True)
+            removed_dirs.append(udir)
+        except Exception:  # noqa: BLE001
+            pass
+
+    return {"killed_pids": killed_pids, "removed_dirs": removed_dirs}
+
+
+async def _idle_gc_loop(idle_seconds: float, interval_seconds: float) -> None:
+    """Background task: sweep idle tabs/browsers every `interval_seconds`."""
+    log = logging.getLogger("umbra.gc")
+    log.info("idle GC started (idle=%ss, interval=%ss)", idle_seconds, interval_seconds)
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            res = await cleanup_stale_internal(idle_seconds)
+            if res["closed_tabs"] or res["closed_browsers"]:
+                log.info("idle GC reaped %s", res)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:  # noqa: BLE001
+            log.warning("idle GC error: %s", e)
+
+
+@mcp.tool()
+async def cleanup_stale(idle_seconds: float = 600.0) -> dict[str, Any]:
+    """Manually reap tabs idle ≥ idle_seconds + browsers with no remaining tabs.
+
+    Ex: cleanup_stale(idle_seconds=300) → {"closed_tabs":["t2"],"closed_browsers":[]}"""
+    return _compact(await cleanup_stale_internal(idle_seconds))
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# REST + auth
+# ═════════════════════════════════════════════════════════════════════════
+
+
+def _load_api_keys(cli_keys: list[str] | None) -> set[str]:
+    keys: set[str] = set()
+    if cli_keys:
+        keys.update(k.strip() for k in cli_keys if k.strip())
+    env = os.environ.get("UMBRA_API_KEYS", "")
+    if env:
+        keys.update(k.strip() for k in env.split(",") if k.strip())
+    return keys
+
+
+def _build_auth_middleware(api_keys: set[str]):
+    """Starlette ASGI middleware enforcing X-API-Key / Bearer auth.
+
+    Skips: /healthz (liveness), OPTIONS preflight.
+    Constant-time compare via secrets.compare_digest."""
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+
+    OPEN_PATHS = {"/healthz"}
+
+    def _key_ok(presented: str) -> bool:
+        for k in api_keys:
+            if secrets.compare_digest(presented, k):
+                return True
+        return False
+
+    class APIKeyAuthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            if request.method == "OPTIONS" or request.url.path in OPEN_PATHS:
+                return await call_next(request)
+            presented = request.headers.get("x-api-key", "")
+            if not presented:
+                auth = request.headers.get("authorization", "")
+                if auth.lower().startswith("bearer "):
+                    presented = auth.split(None, 1)[1].strip()
+            if not presented or not _key_ok(presented):
+                return JSONResponse(
+                    {"error": "unauthorized", "hint": "send X-API-Key or Authorization: Bearer <key>"},
+                    status_code=401,
+                )
+            return await call_next(request)
+
+    return APIKeyAuthMiddleware
+
+
+def _register_rest_routes() -> None:
+    """Expose every @mcp.tool() over plain HTTP JSON.
+
+    GET  /api/tools                   → list tools + schemas
+    POST /api/tools/{name}            → call tool, JSON body = arguments
+    POST /api/call                    → {"tool": "...", "args": {...}}
+    GET  /healthz                     → liveness
+    """
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    def _serialize(result: Any) -> Any:
+        if hasattr(result, "structured_content") and result.structured_content is not None:
+            return result.structured_content
+        if hasattr(result, "content"):
+            out = []
+            for block in result.content or []:
+                text = getattr(block, "text", None)
+                if text is not None:
+                    try:
+                        out.append(json.loads(text))
+                    except Exception:
+                        out.append(text)
+                else:
+                    out.append(getattr(block, "model_dump", lambda: str(block))())
+            if len(out) == 1:
+                return out[0]
+            return out
+        return str(result)
+
+    @mcp.custom_route("/healthz", methods=["GET"])
+    async def _health(_req: Request) -> JSONResponse:  # noqa: ARG001
+        return JSONResponse({"ok": True, "server": "umbra"})
+
+    @mcp.custom_route("/api/tools", methods=["GET"])
+    async def _list(_req: Request) -> JSONResponse:  # noqa: ARG001
+        tools = await mcp.list_tools()
+        return JSONResponse({
+            "tools": [
+                {
+                    "name": t.name,
+                    "description": getattr(t, "description", None),
+                    "input_schema": getattr(t, "parameters", None) or getattr(t, "inputSchema", None),
+                }
+                for t in tools
+            ]
+        })
+
+    @mcp.custom_route("/api/tools/{name}", methods=["POST"])
+    async def _call_named(req: Request) -> JSONResponse:
+        name = req.path_params["name"]
+        try:
+            args = await req.json() if (await req.body()) else {}
+        except Exception as e:
+            return JSONResponse({"error": f"invalid json: {e}"}, status_code=400)
+        if not isinstance(args, dict):
+            return JSONResponse({"error": "body must be a JSON object of arguments"}, status_code=400)
+        try:
+            result = await mcp.call_tool(name, args)
+        except Exception as e:
+            tn = type(e).__name__
+            code = 404 if tn == "NotFoundError" else (400 if tn in ("ValidationError", "ToolError") else 500)
+            return JSONResponse({"error": str(e), "type": tn}, status_code=code)
+        return JSONResponse({"ok": True, "tool": name, "result": _serialize(result)})
+
+    @mcp.custom_route("/api/call", methods=["POST"])
+    async def _call_generic(req: Request) -> JSONResponse:
+        try:
+            body = await req.json()
+        except Exception as e:
+            return JSONResponse({"error": f"invalid json: {e}"}, status_code=400)
+        name = body.get("tool") if isinstance(body, dict) else None
+        args = body.get("args") or body.get("arguments") or {}
+        if not name:
+            return JSONResponse({"error": "missing 'tool' field"}, status_code=400)
+        try:
+            result = await mcp.call_tool(name, args)
+        except Exception as e:
+            tn = type(e).__name__
+            code = 404 if tn == "NotFoundError" else (400 if tn in ("ValidationError", "ToolError") else 500)
+            return JSONResponse({"error": str(e), "type": tn}, status_code=code)
+        return JSONResponse({"ok": True, "tool": name, "result": _serialize(result)})
+
+
+def _ensure_self_signed_cert(host: str) -> tuple[str, str]:
+    """Generate (or reuse) a self-signed cert for local HTTPS. Returns (cert_path, key_path).
+
+    Cached in ~/.cache/umbra/tls/. Cert covers `host`, `localhost`, `127.0.0.1`, `::1`.
+    Valid 365 days. ECDSA P-256 (small + fast).
+    """
+    import datetime as _dt
+    import ipaddress
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    cache_dir = Path.home() / ".cache" / "umbra" / "tls"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cert_path = cache_dir / "umbra-selfsigned.crt"
+    key_path = cache_dir / "umbra-selfsigned.key"
+
+    # Reuse if both present + cert still valid for >7 days
+    if cert_path.exists() and key_path.exists():
+        try:
+            cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+            if cert.not_valid_after_utc - _dt.datetime.now(_dt.timezone.utc) > _dt.timedelta(days=7):
+                return str(cert_path), str(key_path)
+        except Exception:  # noqa: BLE001
+            pass  # fall through and regenerate
+
+    log = logging.getLogger("umbra.tls")
+    log.info("generating self-signed cert for %s → %s", host, cache_dir)
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "umbra-local"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "umbra"),
+    ])
+    san_entries: list[x509.GeneralName] = [
+        x509.DNSName("localhost"),
+        x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+        x509.IPAddress(ipaddress.ip_address("::1")),
+    ]
+    # Add the bind host if it's a hostname or non-loopback IP
+    try:
+        ip = ipaddress.ip_address(host)
+        if str(ip) not in ("127.0.0.1", "::1", "0.0.0.0", "::"):
+            san_entries.append(x509.IPAddress(ip))
+    except ValueError:
+        if host not in ("localhost",):
+            san_entries.append(x509.DNSName(host))
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject).issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - _dt.timedelta(minutes=5))
+        .not_valid_after(now + _dt.timedelta(days=365))
+        .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+    os.chmod(key_path, 0o600)
+    return str(cert_path), str(key_path)
+
+
+async def _shutdown_cleanup() -> None:
+    """Best-effort: close every browser + rmtree owned profile dirs."""
+    log = logging.getLogger("umbra.shutdown")
+    for bid in list(_state["browsers"].keys()):
+        try:
+            await _close_browser_internal(bid)
+        except Exception as e:  # noqa: BLE001
+            log.warning("error closing %s: %s", bid, e)
+    # Sweep any leftover uc_* dirs we owned
+    try:
+        _kill_orphan_chromes()
+    except Exception as e:  # noqa: BLE001
+        log.warning("orphan sweep error: %s", e)
+
+
+def _install_signal_handlers(loop: asyncio.AbstractEventLoop) -> None:
+    log = logging.getLogger("umbra.signal")
+
+    def _handler(signum: int) -> None:
+        log.warning("signal %s received → graceful shutdown", signum)
+        loop.create_task(_shutdown_cleanup())
+        # Give shutdown ~3s to drain, then stop the loop
+        loop.call_later(3.0, loop.stop)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _handler, sig)
+        except NotImplementedError:
+            # Windows fallback
+            signal.signal(sig, lambda s, _f: _handler(s))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="umbra-server")
-    parser.add_argument("--transport", choices=("stdio", "sse"), default="stdio")
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "sse", "http", "streamable-http"),
+        default="stdio",
+        help="stdio (default), sse, or http (streamable-http + REST shim at /api/*)",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="bind host (use 0.0.0.0 for LAN)")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--path", default="/mcp", help="MCP HTTP mount path")
+    parser.add_argument(
+        "--api-key", action="append", default=None,
+        help="require this API key (repeat for multiple). Also reads UMBRA_API_KEYS env (comma-sep). HTTP only.",
+    )
+    parser.add_argument(
+        "--no-auth", action="store_true",
+        help="explicitly disable API key auth even when keys are set (dangerous, dev only).",
+    )
+    parser.add_argument(
+        "--idle-timeout", type=float, default=1800.0,
+        help="reap tabs idle >= this many seconds (default 1800; 0 disables idle GC).",
+    )
+    parser.add_argument(
+        "--gc-interval", type=float, default=60.0,
+        help="how often the idle GC runs in seconds (default 60).",
+    )
+    parser.add_argument(
+        "--no-orphan-sweep", action="store_true",
+        help="skip the startup chrome-orphan sweep.",
+    )
+    parser.add_argument("--tls-cert", default=None, help="path to TLS cert (PEM). enables HTTPS.")
+    parser.add_argument("--tls-key", default=None, help="path to TLS private key (PEM).")
+    parser.add_argument(
+        "--tls-self-signed", action="store_true",
+        help="generate (or reuse) a self-signed cert in ~/.cache/umbra/tls/ for local HTTPS.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+    log = logging.getLogger("umbra.server")
+
+    # Startup: kill orphan chromes from prior runs (always safe — only kills
+    # chromes whose parent isn't us, and only those using uc_* profile dirs)
+    if not args.no_orphan_sweep:
+        try:
+            res = _kill_orphan_chromes()
+            if res["killed_pids"] or res["removed_dirs"]:
+                log.info("startup orphan sweep: %s", res)
+        except Exception as e:  # noqa: BLE001
+            log.warning("startup orphan sweep failed: %s", e)
+
+    if args.transport == "stdio":
+        # stdio is single-client, no auth/REST/uvicorn — keep simple
+        mcp.run()
+        return
 
     if args.transport == "sse":
-        mcp.run(transport="sse", host="127.0.0.1", port=args.port)
+        # legacy SSE transport — no auth wiring (FastMCP-managed lifecycle)
+        if args.api_key or os.environ.get("UMBRA_API_KEYS"):
+            log.warning("API keys set but --transport sse doesn't support them — use http instead")
+        mcp.run(transport="sse", host=args.host, port=args.port)
+        return
+
+    # ─── HTTP transport: REST + native MCP + auth + GC ───────────────────
+    _register_rest_routes()
+
+    api_keys = _load_api_keys(args.api_key)
+    middlewares: list[Any] = []
+    if api_keys and not args.no_auth:
+        from starlette.middleware import Middleware
+        middlewares.append(Middleware(_build_auth_middleware(api_keys)))
+        log.info("auth: %d API key(s) loaded", len(api_keys))
+    elif args.no_auth:
+        log.warning("auth DISABLED via --no-auth — anyone can drive the browser")
     else:
-        mcp.run()
+        log.warning(
+            "no API keys configured (set --api-key or UMBRA_API_KEYS). "
+            "Bind 127.0.0.1 only, or pass --api-key."
+        )
+
+    app = mcp.http_app(path=args.path, middleware=middlewares or None, transport="http")
+
+    import uvicorn
+
+    # ─── TLS resolution ──────────────────────────────────────────────────
+    tls_cert: str | None = args.tls_cert
+    tls_key: str | None = args.tls_key
+    if args.tls_self_signed and not (tls_cert or tls_key):
+        tls_cert, tls_key = _ensure_self_signed_cert(args.host)
+    elif bool(tls_cert) ^ bool(tls_key):
+        raise SystemExit("--tls-cert and --tls-key must both be set")
+
+    if tls_cert and tls_key:
+        scheme = "https"
+        log.info("HTTPS enabled (cert=%s)", tls_cert)
+    else:
+        scheme = "http"
+        if args.host not in ("127.0.0.1", "::1", "localhost") and not args.no_auth:
+            log.warning(
+                "binding %s without TLS — bearer tokens will leak in transit. "
+                "Use --tls-self-signed for local or --tls-cert/--tls-key for prod.",
+                args.host,
+            )
+    log.info("umbra-server listening on %s://%s:%d%s", scheme, args.host, args.port, args.path)
+
+    config = uvicorn.Config(
+        app, host=args.host, port=args.port,
+        log_level="debug" if args.verbose else "info",
+        lifespan="on",
+        ssl_certfile=tls_cert,
+        ssl_keyfile=tls_key,
+    )
+    server = uvicorn.Server(config)
+
+    async def _serve() -> None:
+        loop = asyncio.get_running_loop()
+        _install_signal_handlers(loop)
+        gc_task: asyncio.Task | None = None
+        if args.idle_timeout and args.idle_timeout > 0:
+            gc_task = asyncio.create_task(
+                _idle_gc_loop(args.idle_timeout, args.gc_interval)
+            )
+        try:
+            await server.serve()
+        finally:
+            if gc_task:
+                gc_task.cancel()
+                with __import__("contextlib").suppress(Exception):
+                    await gc_task
+            await _shutdown_cleanup()
+
+    asyncio.run(_serve())
 
 
 if __name__ == "__main__":

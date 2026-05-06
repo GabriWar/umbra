@@ -83,6 +83,79 @@ Restart Claude Code → `/mcp` shows `umbra` w/ 77 tools. For Cursor / Claude De
 
 ---
 
+## 🌐 HTTP API mode
+
+stdio is for one MCP client per process. For remote agents, n8n, OpenAI function-calling, plain `curl`, or anything that isn't an MCP client — run umbra as an HTTPS server with API-key auth.
+
+```bash
+# local HTTPS (self-signed cert auto-generated + cached in ~/.cache/umbra/tls/)
+UMBRA_API_KEYS="$(openssl rand -hex 32)" \
+  uv run umbra-server --transport http --host 127.0.0.1 --port 8765 --tls-self-signed
+
+# prod TLS (use a real cert from caddy/nginx/letsencrypt or pass directly)
+UMBRA_API_KEYS=key1,key2 \
+  uv run umbra-server --transport http --host 0.0.0.0 --port 443 \
+    --tls-cert /etc/ssl/umbra.crt --tls-key /etc/ssl/umbra.key
+```
+
+Endpoints (all gated by `X-API-Key: <key>` or `Authorization: Bearer <key>`, except `/healthz`):
+
+| route | method | purpose |
+|---|---|---|
+| `/healthz` | GET | liveness, no auth |
+| `/api/tools` | GET | list all 84 tools + JSON schemas |
+| `/api/tools/{name}` | POST | call tool, body = `{args...}` |
+| `/api/call` | POST | generic dispatch, body = `{"tool":"...","args":{...}}` |
+| `/mcp` | POST | native streamable-http MCP for proper MCP clients |
+
+```bash
+# discover tools
+curl -k -H "x-api-key: $KEY" https://localhost:8765/api/tools | jq '[.tools[].name]'
+
+# call a tool
+curl -k -H "x-api-key: $KEY" -X POST https://localhost:8765/api/tools/spawn \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://example.com"}'
+```
+
+### server flags
+
+```
+--transport stdio|sse|http      stdio = MCP only (default), http = REST + MCP + auth
+--host 127.0.0.1                bind address (use 0.0.0.0 for LAN)
+--port 8765
+--path /mcp                     native MCP mount path
+--api-key KEY                   repeatable; or set UMBRA_API_KEYS=k1,k2
+--no-auth                       disable auth (dev only — bearer leak hazard)
+--tls-cert PATH --tls-key PATH  enable HTTPS with your cert
+--tls-self-signed               auto-generate + cache a self-signed cert
+--idle-timeout 1800             reap tabs idle ≥ this many seconds (0 disables GC)
+--gc-interval 60                how often the idle GC runs
+--no-orphan-sweep               skip startup chrome cleanup
+-v                              verbose logs
+```
+
+### lifecycle hygiene
+
+- **idle GC** — tabs not touched in `--idle-timeout` get auto-closed. Browsers with no remaining tabs follow. Manual trigger: call the `cleanup_stale` tool with `idle_seconds`.
+- **startup orphan sweep** — chrome procs from prior umbra-server crashes (matched by `--user-data-dir=/tmp/uc_*` w/ a parent pid that isn't us) are SIGTERM'd + their profile dirs `rmtree`d. Skip with `--no-orphan-sweep`.
+- **graceful shutdown** — SIGTERM/SIGINT closes every browser + sweeps profile dirs before exit.
+
+### TODOs
+
+- **multi-tenancy.** Right now all API keys share one global `_state` — every key sees every browser/tab/proxy/session by id. For multiple users with isolation, we need to:
+  - tag every browser/tab/route/hook/handoff/session entry with the calling key (`owner_key_id`).
+  - scope `list_browsers` / `list_tabs` / `proxy_pool_list` / `session_list` to the caller's namespace.
+  - reject cross-tenant `tab_id` / `browser_id` references with 403.
+  - per-key proxy pools and quota (max tabs, max bandwidth, idle-timeout override).
+  - audit log keyed by `owner_key_id`.
+
+  For now: one server = one trust domain. Run separate `umbra-server` processes on different ports if you need real isolation.
+- mTLS option (client-cert auth) instead of bearer keys.
+- per-key rate limiting + quotas.
+
+---
+
 ## 🎯 recipes
 
 ### `batch` ⭐ flagship — N tools in one MCP round-trip
