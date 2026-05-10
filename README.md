@@ -153,6 +153,14 @@ curl -k -H "x-api-key: $KEY" -X POST https://localhost:8765/api/tools/spawn \
   For now: one server = one trust domain. Run separate `umbra-server` processes on different ports if you need real isolation.
 - mTLS option (client-cert auth) instead of bearer keys.
 - per-key rate limiting + quotas.
+- **CloakBrowser integration** — adopt [CloakHQ/CloakBrowser](https://github.com/CloakHQ/CloakBrowser) patched chromium (49–57 C++ source patches: canvas/WebGL/audio/font/GPU/WebRTC/screen/timing) as the default chromium binary. JS-shim stealth (current) loses to native patches because detectors check shim artifacts. Plan:
+  - `umbra setup` CLI → DL cloak binary from `cloakbrowser.dev`, SHA256 verify, cache `~/.umbra/cloak/<version>/`. License is free personal+commercial but **no redistribute** — must DL from upstream, never bundle.
+  - `spawn({ chromium: 'cloak' | 'stock' | <path> })`, default `'cloak'`. First spawn w/ missing binary auto-DLs. Env overrides: `UMBRA_CLOAK_BINARY=<path>`, `UMBRA_NO_CLOAK=1` kill-switch. Unsupported platform → fail-soft to stock + warn (cloak supports linux x64/arm64, mac x64/arm64, win x64).
+  - **humanize layer** port (ref `cloakbrowser/human/`, ~500–800 LOC TS under `src/humanize/`): bezier mouse curves w/ aim points, per-char typing w/ typos+self-correct, scroll accel/decel. Opt-in `humanize: true` on `aria_click`/`aria_type`/`click_at`/`scroll`/`drag`. Presets `default`/`careful` + custom config (`mistype_chance`, `typing_delay`, `idle_between_actions`). Works on stock chromium too.
+  - **geoip-from-proxy** → lookup proxy exit IP, derive timezone+locale, apply via CDP `Emulation.setTimezoneOverride` + `setLocaleOverride`. Opt-in `geoip: true` on spawn. Cache lookups per proxy URL.
+  - **deterministic fingerprint seed** — `spawn({ fingerprintSeed: 'abc' })` → seedable PRNG feeds `rotate_fingerprint`. Reproducible identity for session persistence + detection debugging.
+  - **storage quota normalization** via CDP `Storage.overrideQuotaForOrigin` for fingerprintjs compat.
+  - **WebRTC IP override** via CDP (partial — won't match cloak's native patch but better than current). `webrtcIp: 'auto' | <ip>`, `auto` reuses geoip exit IP.
 
 ---
 
