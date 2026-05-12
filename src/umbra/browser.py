@@ -251,6 +251,19 @@ class StealthOptions:
     extra_args: list[str] = field(default_factory=list)
     window_size: tuple[int, int] = (1920, 1080)
 
+    # Chromium binary selection:
+    #   "cloak"  (default) → CloakBrowser patched build (canvas/audio/webgl/
+    #            font/gpu/webrtc/screen/timing C++ patches). Auto-downloaded
+    #            on first spawn into ~/.umbra/cloak/<tag>/. Beats JS shims.
+    #   "stock" → use the system chromium (chrome_path or auto-detect).
+    #   "<path>" → absolute path to a chromium binary (overrides chrome_path).
+    # Env overrides:
+    #   UMBRA_NO_CLOAK=1   → force stock even if chromium="cloak"
+    #   UMBRA_CLOAK_BINARY=<path> → use this binary as cloak (skip DL)
+    # Unsupported platforms (mac-x64, win-arm64, exotic arches) fall back to
+    # stock with a warning instead of raising.
+    chromium: str = "cloak"
+
     # Performance / footprint
     #   low_memory=True: cut ~80-150MB resident RAM via plausible feature
     #     disables. Stealth-neutral. Use for parallel session farms or
@@ -277,12 +290,126 @@ class StealthBrowser:
         self._pool_browser_id: str | None = None
         self._pool_entry: Any = None      # ProxyEntry held for this session
         self._proxy_creds: tuple[str, str] | None = None  # (user, pass) for CDP auth
+        # Set during start() — True when chrome_path was resolved from cloak
+        # cache (or env). Read by _configure_tab → inject.install to skip JS
+        # shims that overlap with cloak's native patches.
+        self._cloak_active: bool = False
 
     @property
     def browser(self) -> uc.Browser:
         if self._browser is None:
             raise RuntimeError("StealthBrowser not started — call await start() first")
         return self._browser
+
+    @staticmethod
+    def _cloak_prompt_install() -> bool:
+        """Ask the user (TTY only) whether to install cloak now.
+
+        Returns True iff the user agreed and the install succeeded. Persists
+        a `.declined` marker in the cache root when the user says no, so we
+        don't prompt again on subsequent spawns. Non-interactive callers
+        (no TTY, MCP/HTTP server, CI) silently return False.
+        """
+        import sys as _sys
+        from umbra.cloak import CloakUnavailable, install_latest
+        from umbra.cloak.loader import cache_root
+
+        root = cache_root()
+        declined = root / ".declined"
+        if declined.exists():
+            return False
+        if not (_sys.stdin.isatty() and _sys.stderr.isatty()):
+            return False
+        try:
+            print(
+                "\nCloakBrowser is not installed. It's a patched chromium build "
+                "that beats JS-shim stealth via native C++ patches.",
+                file=_sys.stderr,
+            )
+            print(
+                "Install now? (~80 MB download, cached to ~/.umbra/cloak/) [Y/n] ",
+                end="", file=_sys.stderr, flush=True,
+            )
+            ans = _sys.stdin.readline().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        if ans not in ("", "y", "yes"):
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+                declined.write_text(
+                    "user declined cloak install — remove this file to re-prompt\n"
+                )
+                print(
+                    "skipping cloak — to install later: `python -m umbra --setup`",
+                    file=_sys.stderr,
+                )
+            except OSError:
+                pass
+            return False
+        print("downloading CloakBrowser ...", file=_sys.stderr, flush=True)
+        try:
+            install_latest()
+        except CloakUnavailable as e:
+            print(f"cloak install failed: {e}", file=_sys.stderr)
+            return False
+        return True
+
+    def _resolve_chromium_binary(self) -> Any:
+        """Pick the chromium binary per `chromium=` option + env overrides.
+
+        Returns a pathlib.Path (or None when caller should leave the existing
+        chrome_path / nodriver auto-detect in place).
+
+        Resolution order, highest priority first:
+          1. env UMBRA_NO_CLOAK=1                  → stock (None)
+          2. opts.chromium = "<absolute path>"     → that path
+          3. opts.chromium = "stock"               → stock (None)
+          4. env UMBRA_CLOAK_BINARY=<path>         → that path (no DL)
+          5. opts.chromium = "cloak" (default)     → resolve+install cloak
+        On any cloak failure (unsupported platform / DL error) we log a
+        warning and return None so the caller falls back to stock.
+        """
+        if os.environ.get("UMBRA_NO_CLOAK"):
+            log.info("UMBRA_NO_CLOAK set — using stock chromium")
+            return None
+
+        choice = (self.options.chromium or "cloak").strip()
+        # Treat an absolute / explicit path as a manual override.
+        if choice not in ("cloak", "stock") and choice:
+            from pathlib import Path as _P
+            p = _P(choice).expanduser()
+            if not p.is_file():
+                log.warning("chromium=%r not found — falling back to stock", choice)
+                return None
+            return p
+
+        if choice == "stock":
+            return None
+
+        # cloak path.
+        try:
+            from umbra.cloak import CloakUnavailable, resolve_cloak_binary
+        except Exception as e:  # noqa: BLE001
+            log.warning("cloak loader import failed (%s) — using stock", e)
+            return None
+        # No silent auto-download. Try the cache first; if empty AND we're on
+        # an interactive TTY, prompt the user once. Non-TTY callers (MCP/HTTP
+        # server, CI) get a warn-and-fall-back so spawn doesn't hang.
+        try:
+            return resolve_cloak_binary(auto_download=False)
+        except CloakUnavailable:
+            pass
+        if self._cloak_prompt_install():
+            try:
+                return resolve_cloak_binary(auto_download=False)
+            except CloakUnavailable as e:
+                log.warning("cloak install reported ok but resolve failed: %s", e)
+                return None
+        log.warning(
+            "CloakBrowser not installed — using stock chromium. "
+            "Run `python -m umbra --setup` to fetch the patched build.",
+        )
+        return None
 
     async def start(self) -> uc.Browser:
         opts = self.options
@@ -297,6 +424,22 @@ class StealthBrowser:
         # Memory-conscious flags (opt-in).
         if opts.low_memory:
             flags.extend(_LOW_MEMORY_FLAGS)
+
+        # Resolve chromium binary selection. cloak wins by default — its C++
+        # patches against canvas/audio/webgl/font/gpu/webrtc surfaces beat our
+        # JS shims because detectors check the underlying API surface, not
+        # property values. JS shims are layered on top only for tells that
+        # live purely in JS-land (navigator.webdriver etc.); the per-surface
+        # noise is short-circuited when cloak is active so we don't
+        # double-fingerprint the page.
+        cloak_path = self._resolve_chromium_binary()
+        if cloak_path is not None:
+            # Override chrome_path; downstream detect_chrome_version + nodriver
+            # use this path.
+            opts.chrome_path = str(cloak_path)
+            self._cloak_active = True
+        else:
+            self._cloak_active = False
 
         # Detect actual Chrome version → build matching UA + UA-CH metadata.
         # We MUST pin all three (UA string, UA-CH brands, UA-CH fullVersionList)
@@ -428,11 +571,32 @@ class StealthBrowser:
     async def _configure_tab(self, tab: Any) -> None:
         """Install stealth payload + apply CDP overrides on a tab."""
         opts = self.options
+        # If cloak is active, force minimal payload regardless of user setting.
+        # Cloak's C++ patches already noise canvas/audio/webgl/font/etc at the
+        # API surface — layering JS-side noise on top would (a) double-jitter
+        # the fingerprint (cloak applies once, JS applies again), and (b) the
+        # JS hooks themselves are detectable as stealth-lib signatures.
+        # Minimal payload only strips automation tells — orthogonal to cloak.
+        effective_mode = opts.stealth_mode
+        if self._cloak_active and effective_mode != "minimal":
+            log.info(
+                "cloak active — overriding stealth_mode=%r → 'minimal' "
+                "(cloak handles per-surface noise natively)",
+                effective_mode,
+            )
+            effective_mode = "minimal"
         await install_stealth(
             tab,
             timezone=opts.timezone,
             chrome_version=self._chrome_version,
-            mode=opts.stealth_mode,  # type: ignore[arg-type]
+            mode=effective_mode,  # type: ignore[arg-type]
+            # Pass UA-CH only when cloak is active — stock chromium honors
+            # Network.setUserAgentOverride below correctly, so a JS-side
+            # redefinition there would be unnecessary noise (and an extra
+            # detectable hook). With cloak, its internal UA-CH stub clobbers
+            # CDP's override → we re-assert from JS via defineProperty so
+            # navigator.userAgentData matches the UA string we pinned.
+            ua_metadata=self._ua_meta if self._cloak_active else None,
         )
 
         cdp = uc.cdp

@@ -423,6 +423,7 @@ async def spawn(
     use_proxy_pool: bool = False,
     proxy_country: str | None = None,
     proxy_tag: str | None = None,
+    chromium: str = "cloak",
 ) -> dict[str, Any]:
     """Open stealth tab. browser_id='alice'=isolated Chrome (own cookies/identity, ~1.5s boot).
     For same-identity new pages prefer `navigate` (cheaper). stealth_mode='minimal'
@@ -436,7 +437,12 @@ async def spawn(
 
     Ex: spawn('https://news.ycombinator.com') → {"tab_id":"t0","browser_id":"default","url":"..."}
     Ex: spawn('about:blank', browser_id='alice', proxy='http://1.2.3.4:8080')
-    Ex: spawn(use_proxy_pool=True, proxy_country='US', browser_id='scraper-1')"""
+    Ex: spawn(use_proxy_pool=True, proxy_country='US', browser_id='scraper-1')
+
+    chromium: 'cloak' (default) auto-downloads CloakBrowser's patched chromium
+    (C++ fingerprint patches — beats JS shims). 'stock'=system chromium.
+    Pass an absolute path to use a custom binary. Env: UMBRA_NO_CLOAK=1 forces
+    stock; UMBRA_CLOAK_BINARY=<path> uses that as cloak. See cloak_status."""
     pool = _state.get("proxy_pool") if use_proxy_pool else None
     if use_proxy_pool and pool is None:
         return _compact({"error": "proxy pool empty — call proxy_pool_load first"})
@@ -444,6 +450,7 @@ async def spawn(
         headless=headless, low_memory=low_memory, stealth_mode=stealth_mode,
         timezone=timezone, proxy=proxy, user_agent=user_agent,
         proxy_pool=pool, proxy_country=proxy_country, proxy_tag=proxy_tag,
+        chromium=chromium,
     )
     bid, browser = await _get_or_create_browser(browser_id, opts)
     tab = await browser.new_tab(url)
@@ -2122,6 +2129,43 @@ async def cleanup_stale(idle_seconds: float = 600.0) -> dict[str, Any]:
 
     Ex: cleanup_stale(idle_seconds=300) → {"closed_tabs":["t2"],"closed_browsers":[]}"""
     return _compact(await cleanup_stale_internal(idle_seconds))
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# CloakBrowser — patched-chromium loader (default chromium for spawn).
+# DL'd from CloakHQ/CloakBrowser GH releases, sha256-verified, cached under
+# ~/.umbra/cloak/<tag>/. License = no redistribute, so umbra never bundles.
+# ═════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def cloak_status() -> dict[str, Any]:
+    """Report CloakBrowser install state. No network.
+
+    Returns {platform, supported, kill_switch, env_binary, cache_root, installed[]}.
+    `installed` lists cached release tags + entry-point paths."""
+    from umbra.cloak import cloak_status as _s
+    return _compact(_s())
+
+
+@mcp.tool()
+async def cloak_install(force: bool = False, tag: str | None = None) -> dict[str, Any]:
+    """Download + verify the latest (or pinned) CloakBrowser chromium build.
+
+    Idempotent — already-cached installs return their path. Pass `force=True`
+    to re-download, or `tag='<release-tag>'` to pin a specific version. Runs
+    sha256 verification before extraction. On unsupported platforms returns
+    `{ok:false, error:...}` instead of raising.
+
+    Ex: cloak_install() → {"ok":true,"path":"/home/u/.umbra/cloak/.../chrome","tag":"..."}"""
+    import asyncio as _aio
+    from umbra.cloak import CloakUnavailable, install_latest
+    try:
+        # Sync IO inside MCP — push to a thread so we don't block the loop.
+        path = await _aio.to_thread(install_latest, force=force, tag=tag)
+    except CloakUnavailable as e:
+        return _compact({"ok": False, "error": str(e)})
+    return _compact({"ok": True, "path": str(path)})
 
 
 # ═════════════════════════════════════════════════════════════════════════

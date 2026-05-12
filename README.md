@@ -153,14 +153,12 @@ curl -k -H "x-api-key: $KEY" -X POST https://localhost:8765/api/tools/spawn \
   For now: one server = one trust domain. Run separate `umbra-server` processes on different ports if you need real isolation.
 - mTLS option (client-cert auth) instead of bearer keys.
 - per-key rate limiting + quotas.
-- **CloakBrowser integration** — adopt [CloakHQ/CloakBrowser](https://github.com/CloakHQ/CloakBrowser) patched chromium (49–57 C++ source patches: canvas/WebGL/audio/font/GPU/WebRTC/screen/timing) as the default chromium binary. JS-shim stealth (current) loses to native patches because detectors check shim artifacts. Plan:
-  - `umbra setup` CLI → DL cloak binary from `cloakbrowser.dev`, SHA256 verify, cache `~/.umbra/cloak/<version>/`. License is free personal+commercial but **no redistribute** — must DL from upstream, never bundle.
-  - `spawn({ chromium: 'cloak' | 'stock' | <path> })`, default `'cloak'`. First spawn w/ missing binary auto-DLs. Env overrides: `UMBRA_CLOAK_BINARY=<path>`, `UMBRA_NO_CLOAK=1` kill-switch. Unsupported platform → fail-soft to stock + warn (cloak supports linux x64/arm64, mac x64/arm64, win x64).
-  - **humanize layer** port (ref `cloakbrowser/human/`, ~500–800 LOC TS under `src/humanize/`): bezier mouse curves w/ aim points, per-char typing w/ typos+self-correct, scroll accel/decel. Opt-in `humanize: true` on `aria_click`/`aria_type`/`click_at`/`scroll`/`drag`. Presets `default`/`careful` + custom config (`mistype_chance`, `typing_delay`, `idle_between_actions`). Works on stock chromium too.
-  - **geoip-from-proxy** → lookup proxy exit IP, derive timezone+locale, apply via CDP `Emulation.setTimezoneOverride` + `setLocaleOverride`. Opt-in `geoip: true` on spawn. Cache lookups per proxy URL.
-  - **deterministic fingerprint seed** — `spawn({ fingerprintSeed: 'abc' })` → seedable PRNG feeds `rotate_fingerprint`. Reproducible identity for session persistence + detection debugging.
-  - **storage quota normalization** via CDP `Storage.overrideQuotaForOrigin` for fingerprintjs compat.
-  - **WebRTC IP override** via CDP (partial — won't match cloak's native patch but better than current). `webrtcIp: 'auto' | <ip>`, `auto` reuses geoip exit IP.
+- **CloakBrowser integration** ✓ shipped — patched chromium is now the default. See [§ CloakBrowser](#-cloakbrowser-default-chromium). Deferred follow-ons:
+  - **humanize layer** port (bezier mouse curves w/ aim points, per-char typing w/ typos+self-correct, scroll accel/decel). Opt-in on `aria_click`/`aria_type`/`click_at`/`scroll`/`drag`. Works on stock chromium too.
+  - **geoip-from-proxy** → lookup proxy exit IP, derive timezone+locale, apply via CDP `Emulation.setTimezoneOverride` + `setLocaleOverride`. Opt-in `geoip: true` on spawn.
+  - **deterministic fingerprint seed** — `spawn(fingerprint_seed='abc')` → seedable PRNG for `rotate_fingerprint` reproducibility.
+  - **storage quota normalization** via CDP `Storage.overrideQuotaForOrigin`.
+  - **WebRTC IP override** via CDP — covered by cloak's native patch when cloak is active; CDP fallback only useful on stock.
 
 ---
 
@@ -457,6 +455,98 @@ Every MCP tool response goes through `_compact()`:
 - **URL footnoting in `extract_links`** — repeated hosts factored to `_hosts: {h1: "https://..."}` then referenced. ~50% smaller on link-heavy pages.
 
 Toggle off via `set_verbosity('full')` when you need raw byte-exact output. Lossless: zero failures, zero inflations across all 79 audit calls.
+
+---
+
+## 🥷 CloakBrowser (default chromium)
+
+`spawn` defaults to `chromium="cloak"` — when the
+[CloakBrowser](https://github.com/CloakHQ/CloakBrowser) patched chromium
+build is installed under `~/.umbra/cloak/<tag>/`, every browser uses it.
+Cloak ships 49-57 C++ source patches against canvas, WebGL, audio, font,
+GPU, WebRTC, screen, and timing fingerprint surfaces. Native patches beat
+JS shims because detectors check the underlying API surface, not just
+property values — so umbra auto-downgrades its own `stealth_mode` to
+`minimal` (automation-tell cleanup only) when cloak is active, to avoid
+double-fingerprinting.
+
+### setup (one-time)
+
+Cloak is **not** bundled (license: free use, no redistribute) and is
+**not** silently auto-downloaded. Install once:
+
+```bash
+python -m umbra --setup           # download + verify + cache
+python -m umbra --setup --force   # re-download
+python -m umbra --setup --tag <t> # pin a specific release
+python -m umbra --status          # show install state (no network)
+python -m umbra --uninstall       # wipe ~/.umbra/cloak/
+```
+
+First `spawn()` with cloak missing **on an interactive TTY** prompts to
+install. Non-TTY (MCP/HTTP server, CI, scripts) silently falls back to
+stock chromium with a one-line warning — spawn never hangs on input.
+A `.declined` marker is written if the user says no, suppressing future
+prompts; delete `~/.umbra/cloak/.declined` to re-enable.
+
+MCP tools: `cloak_status()`, `cloak_install(force=False, tag=None)`.
+
+### opt-out
+
+```bash
+# per-spawn:
+spawn(chromium="stock")          # MCP / python
+# globally:
+export UMBRA_NO_CLOAK=1          # kill-switch — every spawn uses stock
+# or point at your own build:
+export UMBRA_CLOAK_BINARY=/path/to/chrome
+```
+
+### platforms
+
+| platform | cloak build | umbra behavior |
+|---|---|---|
+| linux x64   | ✓ | auto |
+| linux arm64 | ✓ | auto |
+| windows x64 | ✓ | auto |
+| darwin arm64| ✓ (separate tag) | auto |
+| darwin x64  | ✗ | fall back to stock + warn |
+| windows arm64 | ✗ | fall back to stock + warn |
+
+GitHub anon API rate limit is 60/h — set `GITHUB_TOKEN` to lift it.
+Manifest cached 24h.
+
+### measured impact (2026-05, linux-x64, headless)
+
+Public aggregate detectors **do not visibly shift** with cloak — they mostly
+probe the surfaces JS shims already cover (`navigator.webdriver`, basic
+canvas hash, automation flags). The C++ patches harden deeper surfaces those
+aggregates don't score:
+
+| signal | stock + JS shim | + cloak | note |
+|---|---|---|---|
+| creepjs headless % | ≤5 | ≤5 | unchanged — aggregate baseline |
+| creepjs stealth %  | ≤5 | ≤5 | unchanged |
+| sannysoft pass     | 30+/31 | 29/31 | WebGL Vendor/Renderer now report "no webgl context" — cloak strips the uniquely-identifying GPU strings on purpose (intentional surface cut, not a regression) |
+| automation tells   | 0 | 0 | unchanged |
+| UA-CH brands.Chromium version | matches UA | **matches UA** | ✓ fixed — cloak's internal UA-CH stub clobbered our `Network.setUserAgentOverride`, so the minimal payload now re-asserts `navigator.userAgentData` via `defineProperty` from the Python-side detected Chrome version. Only injected under cloak. |
+
+Where cloak actually helps (not aggregate-scored by the public detectors):
+canvas/audio per-pixel noise *patterns*, font enumeration consistency,
+exact GPU info strings, screen geometry edge cases, WebRTC IP leak at the
+C++ level, timing-API quantization. If your adversary fingerprints those
+specifically (FingerprintJS Pro, sift, akamai bot manager), cloak shifts
+the needle in ways `sannysoft`/`creepjs` summaries won't show.
+
+### license note (read this)
+
+CloakBrowser's binary license permits free personal **and** commercial *use*
+but forbids **redistribution**. umbra never bundles the binary — it always
+pulls from upstream releases on your machine. Don't repackage `~/.umbra/cloak`
+into your own product or container image you ship to third parties; the
+auto-download flow exists exactly so each user fetches their own copy. See
+[BINARY-LICENSE.md](https://github.com/CloakHQ/CloakBrowser/blob/main/BINARY-LICENSE.md)
+upstream for the exact terms.
 
 ---
 

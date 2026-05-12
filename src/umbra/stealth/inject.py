@@ -41,6 +41,7 @@ async def install(
     timezone: str | None = None,
     chrome_version: str | None = None,
     mode: PayloadMode = "minimal",
+    ua_metadata: dict[str, Any] | None = None,
 ) -> str:
     """Install the stealth payload on a nodriver Tab.
 
@@ -57,6 +58,13 @@ async def install(
         prefix_parts.append(f"window.__umbra_tz = {timezone!r};")
     if chrome_version:
         prefix_parts.append(f"window.__umbra_chrome_version = {chrome_version!r};")
+    if ua_metadata:
+        # Serialize as a JS object literal. json.dumps emits ECMA-valid
+        # primitives (strings, numbers, booleans, arrays, objects), so the
+        # value is a safe drop-in. Used by the payload to rebuild
+        # navigator.userAgentData when cloak's C++ stub clobbers ours.
+        import json as _json
+        prefix_parts.append(f"window.__umbra_uach = {_json.dumps(ua_metadata)};")
     if prefix_parts:
         payload = "\n".join(prefix_parts) + "\n" + payload
 

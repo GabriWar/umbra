@@ -26,12 +26,27 @@ pytestmark = pytest.mark.e2e
 
 @pytest.mark.asyncio
 async def test_sannysoft_full_pass() -> None:
-    """bot.sannysoft.com — must be 30+/31 (allow 1 environmental fail)."""
+    """bot.sannysoft.com — must be 29+/31, only known-design failures allowed.
+
+    Baseline expectations:
+    - stock chromium + JS shim: 30+/31, 1 environmental fail max.
+    - cloak chromium (default): 29/31 — WebGL Vendor/Renderer report
+      "no webgl context" because cloak's C++ patch strips the
+      uniquely-identifying GPU strings on purpose. This is an intentional
+      surface cut, not a regression. Anything else failing IS a regression.
+    """
     from umbra.detection import sannysoft_score
     async with stealth_browser(headless=True, low_memory=True) as b:
         s = await sannysoft_score(b)
-    assert s["passed"] >= 30, f"sannysoft regressed: {s}"
-    assert s["failed"] <= 1, f"sannysoft failures: {s['failures']}"
+        cloak_active = getattr(b, "_cloak_active", False)
+    assert s["passed"] >= 29, f"sannysoft regressed: {s}"
+    # Whitelist cloak's intentional WebGL strip; anything else = regression.
+    CLOAK_EXPECTED = {"WebGL Vendor", "WebGL Renderer"}
+    unexpected = [
+        f for f in s["failures"]
+        if not (cloak_active and f["name"] in CLOAK_EXPECTED)
+    ]
+    assert len(unexpected) <= 1, f"unexpected sannysoft failures: {unexpected}"
 
 
 @pytest.mark.asyncio

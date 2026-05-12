@@ -113,6 +113,81 @@
   // Recommendation: route the browser through a proxy/VPN if LAN IP exposure
   // matters. The IP leak isn't a bot signal — it's a privacy signal.
 
+  // ────────────── 7a. UA-CH re-assert (cloak compat, opt-in) ──────────────
+  // CloakBrowser's C++ patches install their own UA-CH stub that empties or
+  // mismatches navigator.userAgentData.brands[*].version. Detectors cross-
+  // check this against the UA string ("Chrome/146"); an empty Chromium
+  // version is one of the loudest UA-CH-related tells.
+  //
+  // We re-assert from window.__umbra_uach (set by inject.py from the Python-
+  // side detected Chrome version). Only injected when running under cloak —
+  // stock chromium honors CDP `Network.setUserAgentOverride` cleanly, and
+  // we don't want to add an extra detectable hook there.
+  //
+  // The shim covers the three public surfaces sites actually read:
+  //   navigator.userAgentData.brands          (low-entropy)
+  //   navigator.userAgentData.mobile          (low-entropy)
+  //   navigator.userAgentData.platform        (low-entropy)
+  //   navigator.userAgentData.getHighEntropyValues(...) (Promise<{...}>)
+  //   navigator.userAgentData.toJSON()        (DOM spec, sometimes checked)
+  try {
+    const m = window.__umbra_uach;
+    if (m && typeof m === 'object' && Array.isArray(m.brands)) {
+      const cloneBrands = (arr) => arr.map(b => ({ brand: b.brand, version: b.version }));
+      const lo = {
+        brands: cloneBrands(m.brands),
+        mobile: !!m.mobile,
+        platform: m.platform || '',
+      };
+      const hi = {
+        brands: cloneBrands(m.brands),
+        mobile: !!m.mobile,
+        platform: m.platform || '',
+        architecture: m.architecture || '',
+        bitness: m.bitness || '',
+        model: m.model || '',
+        platformVersion: m.platformVersion || '',
+        uaFullVersion: m.fullVersion || '',
+        wow64: !!m.wow64,
+        fullVersionList: cloneBrands(m.fullVersionList || m.brands),
+        formFactor: m.formFactor || ['Desktop'],
+      };
+      // Make the fake quack like the real prototype so `instanceof` checks
+      // pass. Per-property toString of our fn replacements stays as the
+      // synthesized JS source — masking it globally via a Function.prototype
+      // .toString Proxy is itself a known stealth-lib signature creepjs
+      // flags. Sites that probe `userAgentData.getHighEntropyValues.toString
+      // ().includes('[native code]')` will mismatch, but in trade we don't
+      // pay the bigger stealth-detect cost.
+      const proto = Object.getPrototypeOf(navigator.userAgentData || {}) ||
+                    Object.prototype;
+      const fake = Object.create(proto);
+      Object.defineProperty(fake, 'brands', { get() { return cloneBrands(lo.brands); }, enumerable: true });
+      Object.defineProperty(fake, 'mobile',  { get() { return lo.mobile; },             enumerable: true });
+      Object.defineProperty(fake, 'platform',{ get() { return lo.platform; },           enumerable: true });
+      Object.defineProperty(fake, 'toJSON', {
+        value: function toJSON() {
+          return { brands: cloneBrands(lo.brands), mobile: lo.mobile, platform: lo.platform };
+        },
+        configurable: true, writable: true,
+      });
+      Object.defineProperty(fake, 'getHighEntropyValues', {
+        value: function getHighEntropyValues(hints) {
+          const out = { brands: cloneBrands(lo.brands), mobile: lo.mobile, platform: lo.platform };
+          if (Array.isArray(hints)) {
+            for (const h of hints) if (h in hi) out[h] = hi[h];
+          }
+          return Promise.resolve(out);
+        },
+        configurable: true, writable: true,
+      });
+      Object.defineProperty(Navigator.prototype, 'userAgentData', {
+        get() { return fake; },
+        configurable: true,
+      });
+    }
+  } catch (_) {}
+
   // ────────────── 7. event.isTrusted: NOT PATCHED (architectural) ───────────
   // umbra dispatches events via CDP Input.dispatchKeyEvent / dispatchMouseEvent.
   // Those are routed through the OS-input pipeline → Chrome marks them

@@ -55,6 +55,7 @@ all = [
 
 [project.scripts]
 umbra-server = "umbra.server:main"
+umbra-cloak-setup = "umbra.cloak.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/gabriel/umbra"
