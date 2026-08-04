@@ -45,9 +45,8 @@ python -m umbra.server   # ctrl+c after a few seconds — verify tools register
 
 | extra | enables | install |
 |---|---|---|
-| (default) | core 50 tools, encrypted sessions, proxy pool | `pip install -e .` |
+| (default) | core 50 tools, encrypted sessions, proxy pool, `tls_fetch` (curl_cffi w/ Chrome JA3+JA4) | `pip install -e .` |
 | `[markdown]` | `extract_markdown` (readability + markdownify) | `pip install -e ".[markdown]"` |
-| `[tls]` | `tls_fetch` (curl_cffi w/ Chrome JA3+JA4) | `pip install -e ".[tls]"` |
 | `[playwright]` | optional Playwright backend | `pip install -e ".[playwright]"` |
 | `[test]` | pytest + asyncio for regression suite | `pip install -e ".[test]"` |
 | `[all]` | everything above | `pip install -e ".[all]"` |

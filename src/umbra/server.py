@@ -1841,7 +1841,7 @@ async def tls_fetch(url: str, method: str = "GET",
                      body: str | None = None,
                      max_chars: int = 8000) -> dict[str, Any]:
     """Raw HTTP w/ Chrome JA3+JA4. Skip DOM when you only need JSON/HTML. ~50ms vs ~500ms.
-    Skip on client-side-rendered SPAs. Needs `pip install umbra-browser[tls]`.
+    Skip on client-side-rendered SPAs.
 
     Ex: tls_fetch('https://api.example.com/users') → {"status":200,"headers":{...},"body":"{\\"users\\":[...]}"}"""
     from umbra.tls import fetch

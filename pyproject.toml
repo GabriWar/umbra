@@ -23,8 +23,9 @@ classifiers = [
 dependencies = [
     "nodriver>=0.47.0",
     "fastmcp>=2.0",
-    "cryptography>=42",   # encrypted session save/load (umbra.session)
-    "websockets>=13",     # handoff remote-view server (also transitive via nodriver)
+    "cryptography>=42", # encrypted session save/load (umbra.session)
+    "websockets>=13", # handoff remote-view server (also transitive via nodriver)
+    "curl-cffi>=0.15.0",
 ]
 
 [project.optional-dependencies]
@@ -35,9 +36,6 @@ test = [
 playwright = [
     "playwright>=1.48",
 ]
-tls = [
-    "curl_cffi>=0.7",
-]
 sessions = [
     "cryptography>=42",
 ]
@@ -47,7 +45,6 @@ markdown = [
 ]
 all = [
     "playwright>=1.48",
-    "curl_cffi>=0.7",
     "cryptography>=42",
     "markdownify>=0.13",
     "readability-lxml>=0.8",
