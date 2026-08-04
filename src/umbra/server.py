@@ -776,7 +776,11 @@ async def navigate(tab_id: str, url: str, timeout_s: float = 30.0) -> dict[str, 
     try:
         await asyncio.wait_for(tab.get(url), timeout=timeout_s)
     except asyncio.TimeoutError:
-        return _compact({"url": url, "error": f"timeout after {timeout_s}s", "_timeout": True})
+        raise TimeoutError(
+            f"navigate({tab_id!r}, {url!r}) timed out after {timeout_s}s — page never finished loading. "
+            f"The tab is still alive but shows no usable content: do NOT extract/read from it. "
+            f"Retry with a longer timeout_s, try a different URL, or abort this path."
+        ) from None
     return _compact({"url": url})
 
 
