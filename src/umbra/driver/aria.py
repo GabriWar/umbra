@@ -18,6 +18,7 @@ Camoufox/Playwright as the underlying transport.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -224,18 +225,67 @@ class AriaDriver:
         ))
         return result
 
-    async def click(self, idx: int) -> bool:
-        """Activate element by DOM.focus + keyboard. Zero mouse events.
+    async def _object_id(self, idx: int) -> str | None:
+        """RemoteObjectId for the DOM node behind an AX index, or None."""
+        node = self._index.get(idx)
+        if not node or not node.backend_node_id:
+            return None
+        try:
+            res = await self.tab.send(self._cdp.dom.resolve_node(
+                backend_node_id=self._cdp.dom.BackendNodeId(node.backend_node_id),
+            ))
+        except Exception as e:  # noqa: BLE001
+            log.debug("resolve_node failed at idx=%d: %s", idx, e)
+            return None
+        # nodriver returns a RemoteObject (or a (RemoteObject, exc) tuple).
+        obj = res[0] if isinstance(res, tuple) else res
+        return getattr(obj, "object_id", None)
 
-        Direct CDP `DOM.focus(backend_node_id=…)` — no Runtime.callFunctionOn
-        round-trip (was buggy w/ object_id type wrapping). Press Enter for
-        most roles, Space for checkbox/radio/switch.
+    async def _call_on(self, object_id: str, fn: str) -> Any:
+        """Runtime.callFunctionOn(fn, object_id) → plain Python value."""
+        res = await self.tab.send(self._cdp.runtime.call_function_on(
+            function_declaration=fn, object_id=object_id, return_by_value=True,
+        ))
+        obj = res[0] if isinstance(res, tuple) else res
+        return getattr(obj, "value", None)
+
+    async def click(self, idx: int) -> bool:
+        """Activate element, verifying the activation actually landed.
+
+        Zero mouse telemetry either way — the fallback is `el.click()`, which
+        dispatches a trusted-shaped click event without emitting any pointer
+        coordinates, so behavioral fingerprinting still sees nothing.
+
+        Why the verification exists: `DOM.focus` + Enter/Space activates native
+        controls, but a large class of real-world widgets (React/Vue components
+        that bind onClick to a div, custom comboboxes, label-wrapped visually
+        hidden radios) ignore synthetic key events entirely. The old
+        implementation returned True in exactly that case — reporting success
+        while the page never changed, which is worse than failing loudly.
+
+        Strategy: arm a one-shot click listener on the element, try the
+        keyboard path, then check whether a click event actually fired. If it
+        did not, call `el.click()` directly and re-check.
         """
         node = self._index.get(idx)
         if not node or not node.backend_node_id:
             return False
         is_toggle = node.role in {"checkbox", "radio", "switch"}
         key = "Space" if is_toggle else "Enter"
+
+        object_id = await self._object_id(idx)
+
+        # Arm the probe. If we can't resolve the node, fall through to the
+        # legacy keyboard-only path rather than failing the call outright.
+        if object_id:
+            with contextlib.suppress(Exception):
+                await self._call_on(object_id, """function() {
+                    this.__umbraClicked = false;
+                    this.__umbraProbe = () => { this.__umbraClicked = true; };
+                    this.addEventListener('click', this.__umbraProbe, {capture: true});
+                    return true;
+                }""")
+
         try:
             await self.tab.send(self._cdp.dom.focus(
                 backend_node_id=self._cdp.dom.BackendNodeId(node.backend_node_id),
@@ -246,10 +296,135 @@ class AriaDriver:
             await self.tab.send(self._cdp.input_.dispatch_key_event(
                 type_="keyUp", key=key, code=key,
             ))
-            return True
+            keyboard_ok = True
         except Exception as e:  # noqa: BLE001
-            log.warning("aria click failed at idx=%d: %s", idx, e)
-            return False
+            log.debug("aria keyboard activation failed at idx=%d: %s", idx, e)
+            keyboard_ok = False
+
+        if not object_id:
+            # No probe available — preserve old behavior.
+            return keyboard_ok
+
+        fired = await self._call_on(object_id, "function() { return !!this.__umbraClicked; }")
+
+        if not fired:
+            # Keyboard did nothing. Escalate to a direct DOM activation, which
+            # is what custom widget handlers actually listen for.
+            with contextlib.suppress(Exception):
+                await self._call_on(object_id, "function() { this.click(); return true; }")
+            fired = await self._call_on(
+                object_id, "function() { return !!this.__umbraClicked; }")
+            if fired:
+                log.debug("aria click idx=%d needed el.click() fallback", idx)
+
+        with contextlib.suppress(Exception):
+            await self._call_on(object_id, """function() {
+                if (this.__umbraProbe)
+                    this.removeEventListener('click', this.__umbraProbe, {capture: true});
+                delete this.__umbraProbe; delete this.__umbraClicked;
+                return true;
+            }""")
+
+        if not fired:
+            log.warning(
+                "aria click at idx=%d did not activate the element "
+                "(neither key press nor el.click() produced a click event)", idx)
+        return bool(fired)
+
+    async def rect(self, idx: int, *, scroll_into_view: bool = True) -> dict[str, Any] | None:
+        """Viewport rect + center point for an ARIA index.
+
+        Scrolls the element into view first so the coordinates are actually
+        clickable — an off-screen element has a rect, but clicking it lands on
+        whatever happens to occupy that spot. Returns None if the element is
+        not resolvable or has no box (display:none, detached).
+        """
+        object_id = await self._object_id(idx)
+        if not object_id:
+            return None
+        fn = """function() {
+            %s
+            const r = this.getBoundingClientRect();
+            if (!r.width && !r.height) return null;
+            return {x: r.x, y: r.y, w: r.width, h: r.height,
+                    cx: Math.round(r.x + r.width / 2),
+                    cy: Math.round(r.y + r.height / 2)};
+        }""" % ("this.scrollIntoView({block: 'center', inline: 'center'});"
+                if scroll_into_view else "")
+        try:
+            return await self._call_on(object_id, fn)
+        except Exception as e:  # noqa: BLE001
+            log.debug("rect failed at idx=%d: %s", idx, e)
+            return None
+
+    async def selector_for(self, idx: int) -> str | None:
+        """Build a unique CSS selector for the element behind an ARIA index.
+
+        Lets index-based discovery feed selector-based tools (`set_field`)
+        without the caller hand-writing a selector and hoping it matches the
+        same element the snapshot showed them.
+        """
+        object_id = await self._object_id(idx)
+        if not object_id:
+            return None
+        fn = """function() {
+            const esc = s => (window.CSS && CSS.escape) ? CSS.escape(s) : s;
+            if (this.id) return '#' + esc(this.id);
+            if (this.name && this.form)
+                return this.tagName.toLowerCase() + '[name="' + this.name + '"]';
+            const path = [];
+            let el = this;
+            while (el && el.nodeType === 1 && path.length < 6) {
+                let part = el.tagName.toLowerCase();
+                if (el.id) { path.unshift('#' + esc(el.id)); break; }
+                const parent = el.parentElement;
+                if (parent) {
+                    const sibs = Array.from(parent.children)
+                        .filter(c => c.tagName === el.tagName);
+                    if (sibs.length > 1)
+                        part += ':nth-of-type(' + (sibs.indexOf(el) + 1) + ')';
+                }
+                path.unshift(part);
+                el = el.parentElement;
+            }
+            return path.join(' > ');
+        }"""
+        try:
+            return await self._call_on(object_id, fn)
+        except Exception as e:  # noqa: BLE001
+            log.debug("selector_for failed at idx=%d: %s", idx, e)
+            return None
+
+    async def find_all_by_text(self, text: str, *, role_hint: str | None = None,
+                               limit: int = 20) -> list[dict[str, Any]]:
+        """Every element matching `text`, best first — not just the top hit.
+
+        `find_by_text` collapses to a single index, which silently picks for you
+        when a page has several plausible matches (three "+ Add" buttons, say).
+        This returns the candidates so the caller can disambiguate by role or
+        surrounding name instead of guessing.
+        """
+        await self.snapshot()
+        target = text.lower().strip()
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for n in self._index.values():
+            if role_hint and n.role != role_hint:
+                continue
+            for hay in (n.name, n.value or ""):
+                if not hay:
+                    continue
+                hl = hay.lower()
+                if target == hl:
+                    score = 1000
+                elif target in hl:
+                    score = 100 - abs(len(hl) - len(target))
+                else:
+                    continue
+                scored.append((score, {"idx": n.idx, "role": n.role,
+                                       "name": n.name[:80], "score": score}))
+                break
+        scored.sort(key=lambda t: -t[0])
+        return [d for _, d in scored[:limit]]
 
     async def type(self, idx: int, text: str, *, clear: bool = True, jitter: bool = True) -> bool:
         """Focus, optionally clear, then type with humanized log-normal delays."""

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import glob
 import json
 import logging
@@ -46,7 +47,9 @@ import secrets
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Literal
 
@@ -59,6 +62,11 @@ from umbra.driver import utils as tab_utils
 from umbra.driver.intercept import RouteEngine, load_har_text
 
 log = logging.getLogger("umbra.server")
+
+# Where screenshots land. Override with UMBRA_SHOT_DIR when the default tmpdir
+# isn't reachable by whatever reads the images back (containers, sandboxes).
+_SHOT_DIR = Path(os.environ.get("UMBRA_SHOT_DIR")
+                 or Path(tempfile.gettempdir()) / "umbra-shots")
 
 _SERVER_INSTRUCTIONS = """\
 umbra: stealth Chrome automation MCP server.
@@ -77,8 +85,22 @@ READ A PAGE / DOCS / ARTICLE
 CLICK / TYPE / FILL FORM
   → `aria_snapshot` once, then `aria_click` / `aria_type` by idx
   → `find_by_text`      shortcut for "click the button that says X"
-  → `fill_form`         multi-field form in one call
+  → `find_all_by_text`  when several elements share that label — pick deliberately
+  → `set_fields`        DEFAULT for forms: {selector: value} in ONE round-trip.
+                        Type-aware + framework-safe (React/Vue controlled inputs,
+                        <select> by value or visible text, checkbox/radio bools).
+  → `set_field`         same, single field, by idx or selector
+  → `fill_form`         only when the site must observe real KEYSTROKES
+                        (cadence-hashing anti-bot). Slower: types char by char.
+  → `element_rect`      idx → viewport-correct {cx,cy} for click_at/drag
   → `click_at` / `drag` only when ARIA can't reach (canvas, captcha tile)
+
+⚡ BATCH BY DEFAULT — sequential single calls are the #1 source of slowness.
+  → `batch([...])`      run N tools in one round-trip (see the `batch` tool)
+  → `set_fields`        N form values in one JS pass
+  → `evaluate`          supports `await` — click, sleep for the re-render, then
+                        read back the result, all inside one call
+  A form that takes 30 sequential calls usually collapses to 2-3 batched ones.
 
 WAIT FOR SOMETHING
   → `wait_for`          selector / url / network-idle (programmatic)
@@ -738,21 +760,67 @@ async def close_browser(browser_id: str) -> dict[str, Any]:
     return _compact({"closed_browser": browser_id, "closed_tabs": closed_tabs})
 
 
-@mcp.tool()
-async def list_tabs() -> dict[str, Any]:
-    """List open tabs w/ URL+title+browser_id. Cheap.
+def _is_dead_connection(exc: BaseException) -> bool:
+    """True when an exception means the Chrome process is gone, not that the page misbehaved.
 
-    Ex: list_tabs() → {"tabs":[{"id":"t0","browser":"default","url":"https://...","title":"..."}]}"""
+    A crashed / killed / user-closed Chrome leaves the CDP port unbound, so
+    every later call surfaces as ConnectionRefusedError — which reads like a
+    transient network blip unless you know the browser died.
+    """
+    if isinstance(exc, (ConnectionRefusedError, ConnectionResetError)):
+        return True
+    if isinstance(exc, OSError) and exc.errno in (111, 61, 104):
+        return True
+    text = str(exc).lower()
+    return ("connect call failed" in text or "connection refused" in text
+            or "websocket" in text and "closed" in text)
+
+
+@mcp.tool()
+async def list_tabs(prune_dead: bool = True) -> dict[str, Any]:
+    """List open tabs w/ URL+title+browser_id, and whether each is still alive.
+
+    A tab whose Chrome died reports `alive:false` with the reason instead of
+    `url:"?"` — the old output was indistinguishable from a page that merely
+    failed to evaluate, which hides the one fact you need (respawn required).
+    Dead entries are dropped from the registry by default so later calls fail
+    fast with a clear message rather than a raw ConnectionRefusedError.
+
+    Ex: list_tabs() → {"tabs":[{"id":"t0","browser":"default","url":"...","alive":true}]}"""
     out = []
-    for tid, entry in _state["tabs"].items():
+    dead_tabs: list[str] = []
+    for tid, entry in list(_state["tabs"].items()):
+        bid = entry.get("browser_id", "?")
         try:
             tab = entry["tab"]
             url = await tab.evaluate("location.href")
             title = await tab.evaluate("document.title")
-            out.append({"id": tid, "browser": entry["browser_id"], "url": url, "title": title})
-        except Exception:  # noqa: BLE001
-            out.append({"id": tid, "browser": entry.get("browser_id", "?"), "url": "?", "title": "?"})
-    return _compact({"tabs": out})
+            out.append({"id": tid, "browser": bid, "url": url,
+                        "title": title, "alive": True})
+        except Exception as e:  # noqa: BLE001
+            dead = _is_dead_connection(e)
+            out.append({"id": tid, "browser": bid, "alive": False,
+                        "reason": "browser process is gone" if dead
+                                  else f"unresponsive: {type(e).__name__}"})
+            if dead:
+                dead_tabs.append(tid)
+
+    pruned: dict[str, Any] = {}
+    if prune_dead and dead_tabs:
+        for tid in dead_tabs:
+            _state["tabs"].pop(tid, None)
+            _state.get("routes", {}).pop(tid, None)
+            _state.get("hooks", {}).pop(tid, None)
+        orphan_browsers = [
+            bid for bid in list(_state["browsers"])
+            if not any(e["browser_id"] == bid for e in _state["tabs"].values())
+        ]
+        for bid in orphan_browsers:
+            _state["browsers"].pop(bid, None)
+        pruned = {"pruned_tabs": dead_tabs, "pruned_browsers": orphan_browsers,
+                  "hint": "browser died — call spawn() to start a new one"}
+
+    return _compact({"tabs": out, **pruned})
 
 
 @mcp.tool()
@@ -835,9 +903,89 @@ async def aria_click(tab_id: str, idx: int) -> dict[str, Any]:
     """Click ARIA element by idx (zero mouse, semantic). Always prefer over `click_at`.
     Get idx from `aria_snapshot` or `find_by_text`.
 
+    `ok:false` now means the element genuinely did not activate (neither the
+    key press nor the DOM fallback produced a click event) — a real signal, not
+    noise. Re-snapshot and check the idx.
+
     Ex: aria_click('t0', 3) → {"ok":true}"""
     ok = await _get_aria(tab_id).click(idx)
     return _compact({"ok": ok})
+
+
+@mcp.tool()
+async def set_field(tab_id: str, value: Any, idx: int | None = None,
+                    selector: str | None = None) -> dict[str, Any]:
+    """Set a form field's VALUE directly — selects, checkboxes, radios, inputs.
+
+    Pass `idx` (from aria_snapshot/find_by_text) or a CSS `selector`. Writes via
+    the native prototype setter + input/change events, so React/Vue/Angular
+    controlled inputs actually register it. `<select>` matches an option by
+    value OR visible text; checkbox/radio accept true/false.
+
+    Use this rather than `aria_type` whenever you want a value *set* instead of
+    keystrokes *observed* — aria_type cannot tick a checkbox, cannot choose a
+    select option, and masked/controlled inputs swallow its keystrokes.
+
+    Ex: set_field('t0', 'Fluent', idx=29) → {"ok":true,"kind":"select",...}
+    Ex: set_field('t0', True, selector='input[name=gdpr]') → {"ok":true,...}"""
+    if idx is None and not selector:
+        return {"ok": False, "why": "pass either idx or selector"}
+    if selector is None:
+        selector = await _get_aria(tab_id).selector_for(idx)  # type: ignore[arg-type]
+        if not selector:
+            return {"ok": False, "why": f"could not resolve a selector for idx {idx}"}
+    res = await tab_utils.set_field(_get_tab(tab_id), selector, value)
+    if isinstance(res, dict):
+        res.setdefault("selector", selector)
+    return _compact(res)
+
+
+@mcp.tool()
+async def set_fields(tab_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+    """Set MANY form fields in one round-trip. {css_selector: value}.
+
+    Same type-aware, framework-safe semantics as `set_field` (selects by value
+    or visible text, checkbox/radio booleans, native setter + input/change),
+    but the whole map is applied in a single JS pass. Reach for this by default
+    on any form with more than one field — ten `set_field` calls cost ten
+    round-trips, this costs one.
+
+    Ex: set_fields('t0', {'input[name=firstname]': 'Gabriel',
+                          'input[name=email]': 'a@b.c',
+                          'input[name=gdpr]': True,
+                          'select[name=lang]': 'Fluent'})
+        → {"ok":true,"set":[...],"failed":[]}"""
+    return _compact(await tab_utils.set_fields(_get_tab(tab_id), fields))
+
+
+@mcp.tool()
+async def element_rect(tab_id: str, idx: int, scroll_into_view: bool = True) -> dict[str, Any]:
+    """Viewport rect + clickable center for an ARIA idx, scrolled into view.
+
+    Bridges idx-based discovery to the coordinate tools (`click_at`, `drag`,
+    `screenshot_region`) without hand-rolling getBoundingClientRect inside
+    `evaluate`. Returns {x,y,w,h,cx,cy}; cx/cy is the click point.
+
+    Ex: element_rect('t0', 12) → {"ok":true,"x":100,"y":480,"cx":143,"cy":496}"""
+    r = await _get_aria(tab_id).rect(idx, scroll_into_view=scroll_into_view)
+    if r is None:
+        return {"ok": False, "why": f"idx {idx} has no layout box (hidden or detached)"}
+    return _compact({"ok": True, **r})
+
+
+@mcp.tool()
+async def find_all_by_text(tab_id: str, text: str, role_hint: str | None = None,
+                           limit: int = 20) -> dict[str, Any]:
+    """All elements matching `text`, best first — the disambiguating sibling of `find_by_text`.
+
+    `find_by_text` silently picks one when several match (three "+ Add" buttons
+    on one form, say). This lists the candidates with role + name so you choose
+    deliberately.
+
+    Ex: find_all_by_text('t0', 'Add') → {"matches":[{"idx":11,"role":"button",...}]}"""
+    matches = await _get_aria(tab_id).find_all_by_text(
+        text, role_hint=role_hint, limit=limit)
+    return _compact({"matches": matches, "count": len(matches)})
 
 
 @mcp.tool()
@@ -1145,23 +1293,64 @@ async def inspect_element(tab_id: str, selector: str,
 # Screenshots
 # ═════════════════════════════════════════════════════════════════════════
 
-@mcp.tool()
-async def screenshot(tab_id: str, full_page: bool = False, quality: int = 65) -> dict[str, Any]:
-    """JPEG → base64 (q=65 cheap). For VLM visual reasoning. For text use extract_markdown.
+def _save_shot(b64: str, tag: str) -> dict[str, Any]:
+    """Write a base64 JPEG to the screenshot dir; return path + size metadata.
 
-    Ex: screenshot('t0', full_page=True) → {"b64":"...","fmt":"jpeg","len":48201}"""
-    b64 = await tab_utils.screenshot(_get_tab(tab_id), fmt="jpeg", quality=quality, full_page=full_page)
-    return _compact({"b64": b64, "fmt": "jpeg", "len": len(b64)}, max_str=10**9)  # don't truncate the image
+    Images go to disk by default because a full-page capture of a long page is
+    routinely 100k+ characters of base64 — enough to blow an agent's context
+    window in a single tool result, for an image the agent then has to read
+    back anyway. A path costs ~60 characters and the file can be opened by any
+    image-capable reader.
+    """
+    raw = base64.b64decode(b64)
+    _SHOT_DIR.mkdir(parents=True, exist_ok=True)
+    path = _SHOT_DIR / f"{tag}-{uuid.uuid4().hex[:10]}.jpg"
+    path.write_bytes(raw)
+    return {"path": str(path), "fmt": "jpeg", "bytes": len(raw), "b64_len": len(b64)}
+
+
+@mcp.tool()
+async def screenshot(tab_id: str, full_page: bool = False, quality: int = 65,
+                     include_b64: bool = False) -> dict[str, Any]:
+    """JPEG screenshot → saved to disk, returns the PATH. For text use extract_markdown.
+
+    `include_b64=True` additionally inlines the base64. Leave it off unless you
+    genuinely need the bytes in-band: a full-page capture is commonly 100k+
+    base64 characters, which can exhaust an agent's context in one result.
+    Read the returned path with an image-capable reader instead.
+
+    Reading click coordinates off the image? Only `full_page=False` pixels map
+    1:1 onto `click_at` — a full-page capture stitches the whole scroll height,
+    so anything below the fold is offset by the scroll position and clicking
+    those coordinates lands somewhere else. Prefer `element_rect(idx)`, which
+    returns a viewport-correct click point and scrolls the element in first.
+
+    Ex: screenshot('t0', full_page=True) → {"path":"/tmp/umbra-shots/t0-ab12.jpg","bytes":42211}
+    Ex: screenshot('t0', include_b64=True) → {..., "b64":"/9j/4AAQ..."}"""
+    b64 = await tab_utils.screenshot(_get_tab(tab_id), fmt="jpeg", quality=quality,
+                                     full_page=full_page)
+    out = _save_shot(b64, tab_id)
+    if include_b64:
+        out["b64"] = b64
+    return _compact(out, max_str=10**9)  # never truncate an image payload
 
 
 @mcp.tool()
 async def screenshot_region(tab_id: str, x: float, y: float, w: float, h: float,
-                             quality: int = 80) -> dict[str, Any]:
-    """JPEG of a (x,y,w,h) region. For captcha tiles, isolated VLM crops. Rect from inspect_element.
+                             quality: int = 80, include_b64: bool = False) -> dict[str, Any]:
+    """JPEG of a (x,y,w,h) region → saved to disk, returns the PATH.
 
-    Ex: screenshot_region('t0', 100, 200, 300, 100) → {"b64":"...","fmt":"jpeg","rect":{x,y,w,h}}"""
-    b64 = await tab_utils.screenshot_region(_get_tab(tab_id), x, y, w, h, fmt="jpeg", quality=quality)
-    return _compact({"b64": b64, "fmt": "jpeg", "rect": {"x": x, "y": y, "w": w, "h": h}}, max_str=10**9)
+    For captcha tiles and isolated VLM crops. Rect from `element_rect` or
+    `inspect_element`. `include_b64=True` also inlines the base64.
+
+    Ex: screenshot_region('t0', 100, 200, 300, 100) → {"path":"...","rect":{...}}"""
+    b64 = await tab_utils.screenshot_region(_get_tab(tab_id), x, y, w, h,
+                                            fmt="jpeg", quality=quality)
+    out = _save_shot(b64, f"{tab_id}-region")
+    out["rect"] = {"x": x, "y": y, "w": w, "h": h}
+    if include_b64:
+        out["b64"] = b64
+    return _compact(out, max_str=10**9)
 
 
 # ═════════════════════════════════════════════════════════════════════════

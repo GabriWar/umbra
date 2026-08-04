@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import re
 from typing import Any
@@ -134,6 +135,144 @@ async def select_option(tab: Any, selector: str, value: str) -> bool:
         return el.value === {value!r};
     }})()""")
     return bool(result)
+
+
+_SET_FIELD_JS = r"""
+(function(sel, raw) {
+  const el = document.querySelector(sel);
+  if (!el) return {ok: false, why: 'no element matches selector'};
+
+  // React/Vue/Angular track the previous value on the DOM node and swallow
+  // any change where node.value was reassigned directly. Going through the
+  // prototype's native setter defeats that, which is why a plain `el.value =`
+  // silently no-ops on framework-controlled inputs.
+  const nativeSet = (node, prop, v) => {
+    const proto = Object.getPrototypeOf(node);
+    const desc = Object.getOwnPropertyDescriptor(proto, prop)
+              || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, prop);
+    if (desc && desc.set) desc.set.call(node, v);
+    else node[prop] = v;
+  };
+  const fire = (node, types) => {
+    for (const t of types)
+      node.dispatchEvent(new Event(t, {bubbles: true}));
+  };
+
+  const tag = el.tagName.toUpperCase();
+  const type = (el.type || '').toLowerCase();
+  const truthy = v => v === true || v === 'true' || v === 1 || v === '1'
+                   || v === 'on' || v === 'yes' || v === 'checked';
+
+  if (tag === 'SELECT') {
+    // Accept the option's value OR its visible text, like a human would.
+    const want = String(raw);
+    const opts = Array.from(el.options);
+    const hit = opts.find(o => o.value === want)
+             || opts.find(o => o.text.trim() === want.trim())
+             || opts.find(o => o.text.trim().toLowerCase() === want.trim().toLowerCase())
+             || opts.find(o => o.text.trim().toLowerCase().includes(want.trim().toLowerCase()));
+    if (!hit) return {ok: false, why: 'no matching option',
+                      options: opts.slice(0, 25).map(o => o.text.trim())};
+    nativeSet(el, 'value', hit.value);
+    fire(el, ['input', 'change']);
+    return {ok: true, kind: 'select', value: el.value, text: hit.text.trim()};
+  }
+
+  if (type === 'checkbox' || type === 'radio') {
+    const want = truthy(raw);
+    const proto = Object.getPrototypeOf(el);
+    const desc = Object.getOwnPropertyDescriptor(proto, 'checked')
+              || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked');
+    if (el.checked !== want) {
+      if (desc && desc.set) desc.set.call(el, want); else el.checked = want;
+      fire(el, ['click', 'input', 'change']);
+    }
+    return {ok: el.checked === want, kind: type, checked: el.checked};
+  }
+
+  if (el.isContentEditable) {
+    el.focus();
+    el.textContent = String(raw);
+    fire(el, ['input', 'change']);
+    return {ok: true, kind: 'contenteditable', value: el.textContent};
+  }
+
+  if (tag === 'INPUT' || tag === 'TEXTAREA') {
+    nativeSet(el, 'value', String(raw));
+    fire(el, ['input', 'change']);
+    return {ok: el.value === String(raw), kind: type || tag.toLowerCase(), value: el.value};
+  }
+
+  return {ok: false, why: 'element is not a form field', tag: tag};
+})
+"""
+
+
+def _json_result(raw: Any) -> dict[str, Any]:
+    """Parse a JSON.stringify'd evaluate() result into a plain dict.
+
+    `tab.evaluate` hands back nodriver's CDP-serialized shape (nested
+    [key, {type, value}] pairs) unless the payload is already a string, so the
+    JS side stringifies and we parse here — the same round-trip
+    `AriaDriver.current_state` uses.
+    """
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            return {"ok": False, "why": "result was not valid JSON", "raw": raw[:200]}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"ok": False, "why": "result was not an object", "raw": parsed}
+    return {"ok": False, "why": "evaluation returned no result", "raw": repr(raw)[:200]}
+
+
+async def set_field(tab: Any, selector: str, value: Any) -> dict[str, Any]:
+    """Set any form field's value in one call, framework-safe.
+
+    Handles `<select>` (matched by option value *or* visible text), checkboxes
+    and radios (accepts booleans or truthy strings), contenteditable regions,
+    and every `<input>`/`<textarea>` type — always writing through the native
+    prototype setter and firing input+change so React/Vue/Angular actually
+    register the change.
+
+    This exists because `aria_type` drives real keystrokes, which cannot set a
+    checkbox, cannot pick a `<select>` option, and gets mangled by masked or
+    otherwise controlled inputs. Reach for this when you want a *value* set;
+    reach for `aria_type` when you want the keystrokes themselves observed.
+    """
+    raw = await tab.evaluate(
+        f"JSON.stringify(({_SET_FIELD_JS})({selector!r}, {json.dumps(value)}))")
+    return _json_result(raw)
+
+
+async def set_fields(tab: Any, fields: dict[str, Any]) -> dict[str, Any]:
+    """Set many form fields in ONE round-trip. Same semantics as `set_field`.
+
+    `fields` maps CSS selector → value. A ten-field form is one evaluate call
+    instead of ten, which matters more than it looks: each MCP round-trip is
+    framing + scheduling overhead, and interleaving them with re-snapshots is
+    how a form that should take two seconds takes thirty.
+
+    Returns {selector: result} plus rolled-up ok/failed lists.
+    """
+    payload = json.dumps(fields)
+    script = f"""JSON.stringify((() => {{
+        const setOne = {_SET_FIELD_JS};
+        const fields = {payload};
+        const out = {{}};
+        for (const [sel, val] of Object.entries(fields)) {{
+            try {{ out[sel] = setOne(sel, val); }}
+            catch (e) {{ out[sel] = {{ok: false, why: String(e)}}; }}
+        }}
+        return out;
+    }})())"""
+    result = _json_result(await tab.evaluate(script))
+    if result.get("why"):
+        return result
+    ok = [s for s, r in result.items() if isinstance(r, dict) and r.get("ok")]
+    failed = [s for s, r in result.items() if not (isinstance(r, dict) and r.get("ok"))]
+    return {"ok": not failed, "set": ok, "failed": failed, "results": result}
 
 
 async def get_response_body(tab: Any, request_id: str) -> dict[str, Any]:
