@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import contextlib
 import glob
 import json
 import logging
@@ -368,6 +369,13 @@ async def _get_or_create_browser(browser_id: str | None,
     """Resolve browser_id (auto-creates 'default' or named browser if missing)."""
     if browser_id is None:
         browser_id = "default"
+    # A registered browser whose Chrome died (e.g. its last tab was closed)
+    # would hand back a dead CDP connection — drop it and re-launch.
+    existing = _state["browsers"].get(browser_id)
+    if existing is not None and not existing.is_alive():
+        with contextlib.suppress(Exception):
+            await existing.stop()
+        del _state["browsers"][browser_id]
     if browser_id not in _state["browsers"]:
         b = StealthBrowser(opts or StealthOptions(headless=True, low_memory=True))
         # Tag the browser w/ its registry id so the proxy pool's
@@ -697,6 +705,16 @@ async def close(tab_id: str) -> dict[str, Any]:
     entry = _state["tabs"].pop(tab_id, None)
     if entry and entry["tab"]:
         await entry["tab"].close()
+    # Chrome exits with its last tab — drop the now-dead browser from the
+    # registry so the next spawn launches a fresh one instead of reusing a
+    # refused CDP connection.
+    bid = entry["browser_id"] if entry else None
+    if bid and not any(e["browser_id"] == bid for e in _state["tabs"].values()):
+        browser = _state["browsers"].pop(bid, None)
+        if browser is not None:
+            with contextlib.suppress(Exception):
+                await browser.stop()
+        return _compact({"closed": True, "closed_browser": bid})
     return _compact({"closed": True})
 
 

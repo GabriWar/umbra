@@ -283,6 +283,9 @@ class StealthBrowser:
         self.options = options or StealthOptions()
         self._browser: uc.Browser | None = None
         self._tabs: list[Any] = []
+        # The tab Chrome opens on launch (already stealth-configured). The
+        # first new_tab() claims it instead of leaving an empty tab behind.
+        self._launch_tab: Any = None
         self._chrome_version: str | None = None
         self._ua: str | None = None
         self._ua_meta: dict[str, Any] | None = None
@@ -300,6 +303,19 @@ class StealthBrowser:
         if self._browser is None:
             raise RuntimeError("StealthBrowser not started — call await start() first")
         return self._browser
+
+    def is_alive(self) -> bool:
+        """True when Chrome is still usable for opening tabs.
+
+        Chrome exits once its LAST tab closes, so a browser with zero targets
+        is dead even though `_process.returncode` is often still None (nobody
+        reaped it). Reusing one raises ConnectionRefusedError on the next CDP
+        call, so callers must re-launch instead.
+        """
+        b = self._browser
+        if b is None or b.stopped:
+            return False
+        return bool(b.tabs)
 
     @staticmethod
     def _cloak_prompt_install() -> bool:
@@ -546,6 +562,7 @@ class StealthBrowser:
         # for addScriptToEvaluateOnNewDocument).
         if self._browser.tabs:
             await self._configure_tab(self._browser.tabs[0])
+            self._launch_tab = self._browser.tabs[0]
         return self._browser
 
     async def new_tab(self, url: str = "about:blank") -> Any:
@@ -556,9 +573,15 @@ class StealthBrowser:
         fires on the NEXT navigation, so we always navigate after install
         (reloading about:blank if no other URL was requested) to guarantee
         the payload has actually run before the caller does anything.
+
+        The very first call claims the tab Chrome already opened at launch —
+        otherwise every browser is left with a stray blank tab in front.
         """
-        tab = await self.browser.get("about:blank", new_tab=True)
-        await self._configure_tab(tab)
+        if self._launch_tab is not None:
+            tab, self._launch_tab = self._launch_tab, None  # already configured
+        else:
+            tab = await self.browser.get("about:blank", new_tab=True)
+            await self._configure_tab(tab)
         # Trigger the preload by (re)navigating. For a real target URL this is
         # a normal navigation; for about:blank we reload to fire the hook.
         if url and url != "about:blank":
@@ -754,6 +777,7 @@ class StealthBrowser:
                 self._browser.stop()
             self._browser = None
             self._tabs.clear()
+            self._launch_tab = None
         # rmtree nodriver-created temp profile (it doesn't, see start()).
         owned = getattr(self, "_owned_profile_dir", None)
         if owned:
