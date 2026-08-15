@@ -58,7 +58,7 @@ from fastmcp import FastMCP
 
 from umbra.browser import StealthBrowser, StealthOptions
 from umbra.proxypool import ProxyPool, parse_proxy_url
-from umbra.driver.aria import AriaDriver
+from umbra.driver.aria import _FIELD_ROLES, AriaDriver
 from umbra.driver import utils as tab_utils
 from umbra.driver.intercept import RouteEngine, load_har_text
 
@@ -899,20 +899,60 @@ async def reload(tab_id: str, hard: bool = False) -> dict[str, Any]:
 
 @mcp.tool()
 async def aria_snapshot(tab_id: str, max_items: int = 60,
-                          force_refresh: bool = False) -> dict[str, Any]:
+                          force_refresh: bool = False,
+                          only: str | None = None,
+                          fields: bool = False) -> dict[str, Any]:
     """ARIA tree of interactive elements w/ `idx` for click/type. ~50ms. Call BEFORE
     first interaction + after any DOM change (idx invalidates). Repeats group as
     `[12-77] cycle×13: link('A'),link('B')` (lossless — click any idx in range).
 
-    Ex: aria_snapshot('t0') → {"tree":"[0] button \\"Sign in\\"\\n[1] textbox \\"email\\"\\n...","count":12}"""
+    `only`: comma-separated roles to keep, or 'form' for a whole form — every
+    fillable control (textbox/combobox/checkbox/radio/…) PLUS the buttons, so
+    the submit idx is right there. Indexes never shift, so a filtered tree
+    still drives aria_click/set_fields. Default = the full tree.
+
+    `fields=True`: annotate each fillable control with `{sel=… type=email
+    required options=…}` — the CSS selector, input type, constraints and
+    `<select>` options the AX tree alone never tells you. Costs one CDP call
+    per field, no extra round-trip, and saves guessing a selector or a format.
+
+    Ex: aria_snapshot('t0') → {"tree":"[0] button \\"Sign in\\"\\n[1] textbox \\"email\\"\\n...","count":12}
+    Ex: aria_snapshot('t0', only='form', fields=True)
+        → {"tree":"[3] textbox \\"First Name\\" {sel=#firstName type=text required}",...}"""
     drv = _get_aria(tab_id)
     nodes = await drv.snapshot()
+    roles: frozenset[str] | None = None
+    if only:
+        wanted = {r.strip().lower() for r in only.split(",") if r.strip()}
+        if "form" in wanted:
+            wanted.discard("form")
+            # Buttons belong to the form as much as the inputs do: a filtered
+            # tree without the submit button costs the caller a second,
+            # unfiltered snapshot just to find the idx to click.
+            wanted |= set(_FIELD_ROLES) | {"button"}
+        roles = frozenset(wanted)
+    extra = None
+    if fields:
+        targets = [n.idx for n in nodes
+                   if n.role in _FIELD_ROLES
+                   and (roles is None or n.role in roles)]
+        extra = await drv.describe_fields(targets[:max_items])
+    tree = drv.render_tree(max_items=max_items, only=roles, extra=extra)
+    if fields:
+        # Widgets with no ARIA role are absent from the tree entirely, so a
+        # caller reads "the field isn't there" and starts digging through raw
+        # DOM. Name them instead — they are reachable by selector.
+        orphans = await drv.orphan_widgets()
+        if orphans:
+            tree += "\n(no ARIA role — reach by selector: " + "; ".join(
+                f"{o['sel']} {o['text']!r}" for o in orphans) + ")"
     data = _compact({
-        "tree": drv.render_tree(max_items=max_items),
+        "tree": tree,
         "count": len(nodes),
-    }, max_str=4000)
+    }, max_str=8000 if fields else 4000)
     return _maybe_dedup(tab_id, "aria_snapshot",
-                         {"tab_id": tab_id, "max_items": max_items},
+                         {"tab_id": tab_id, "max_items": max_items,
+                          "only": only, "fields": fields},
                          data, force_refresh=force_refresh)
 
 
@@ -925,9 +965,40 @@ async def aria_click(tab_id: str, idx: int) -> dict[str, Any]:
     key press nor the DOM fallback produced a click event) — a real signal, not
     noise. Re-snapshot and check the idx.
 
-    Ex: aria_click('t0', 3) → {"ok":true}"""
-    ok = await _get_aria(tab_id).click(idx)
-    return _compact({"ok": ok})
+    A click that navigates (submit buttons, links) returns
+    `{"ok":true,"navigated":true,"url":"..."}` — no follow-up `current_state`
+    needed to find out where you landed. For submitting a form you just
+    filled, `set_fields(submit=True)` is cheaper still: no snapshot, no click.
+
+    Ex: aria_click('t0', 3) → {"ok":true,"navigated":false}
+    Ex: aria_click('t0', 0) → {"ok":true,"navigated":true,"url":"https://…/post"}"""
+    return _compact(await _get_aria(tab_id).click(idx))
+
+
+@mcp.tool()
+async def combo_select(tab_id: str, idx: int, value: str | None = None,
+                       timeout_s: float = 3.0) -> dict[str, Any]:
+    """Pick a value from a CUSTOM combobox (react-select, autocomplete, etc).
+
+    Native `<select>` is not this tool — use `set_fields`, or read its choices
+    straight off `aria_snapshot(fields=True)`. Custom comboboxes are different:
+    they render their menu only while open, so the options do not exist until
+    something opens them, and the option unmounts the moment it is picked.
+
+    Doing that by hand is click → type → snapshot → click option → verify,
+    with a race at each end (menu not painted yet; option already gone). This
+    does the whole sequence in one call and returns what was actually chosen.
+
+    Omit `value` to just LIST what the dropdown offers without choosing.
+
+    Ex: combo_select('t0', 16, 'Maths')  → {"ok":true,"picked":"Maths"}
+    Ex: combo_select('t0', 19)           → {"ok":true,"options":["NCR","Uttar Pradesh",…]}
+    Ex: combo_select('t0', 19, 'Nowhere')
+        → {"ok":false,"why":"no option matches 'Nowhere'","options":[…]}"""
+    drv = _get_aria(tab_id)
+    if value is None:
+        return _compact(await drv.combo_options(idx, timeout_s=timeout_s))
+    return _compact(await drv.combo_select(idx, value, timeout_s=timeout_s))
 
 
 @mcp.tool()
@@ -944,6 +1015,13 @@ async def set_field(tab_id: str, value: Any, idx: int | None = None,
     keystrokes *observed* — aria_type cannot tick a checkbox, cannot choose a
     select option, and masked/controlled inputs swallow its keystrokes.
 
+    Controlled text inputs that front a widget — react-datepicker and friends —
+    take a written value fine: the native setter + input event is what their
+    onChange parses, so `set_field('t0', '14 Mar 1995', selector='#dob')` beats
+    opening the calendar and hunting for the day cell. Use the calendar (its
+    days are `gridcell` nodes in `aria_snapshot`) only when the input itself is
+    readOnly, which `aria_snapshot(fields=True)` reports.
+
     Ex: set_field('t0', 'Fluent', idx=29) → {"ok":true,"kind":"select",...}
     Ex: set_field('t0', True, selector='input[name=gdpr]') → {"ok":true,...}"""
     if idx is None and not selector:
@@ -959,8 +1037,10 @@ async def set_field(tab_id: str, value: Any, idx: int | None = None,
 
 
 @mcp.tool()
-async def set_fields(tab_id: str, fields: dict[str, Any]) -> dict[str, Any]:
-    """Set MANY form fields in one round-trip. {css_selector: value}.
+async def set_fields(tab_id: str, fields: dict[str, Any],
+                     submit: bool = False,
+                     verbose: bool = False) -> dict[str, Any]:
+    """Set MANY form fields in one round-trip. Keys = CSS selector OR aria idx.
 
     Same type-aware, framework-safe semantics as `set_field` (selects by value
     or visible text, checkbox/radio booleans, native setter + input/change),
@@ -968,12 +1048,66 @@ async def set_fields(tab_id: str, fields: dict[str, Any]) -> dict[str, Any]:
     on any form with more than one field — ten `set_field` calls cost ten
     round-trips, this costs one.
 
+    A numeric key ('3' or 3) is an `aria_snapshot` idx and is resolved to its
+    selector server-side, so a snapshot feeds this tool directly with no
+    selector guessing in between.
+
+    Returns what each field ACTUALLY holds afterwards (`now`), so a verify
+    re-snapshot is unnecessary; `failed` says why per field. `verbose=True`
+    adds the full per-field result dicts.
+
+    `submit=True` submits the field's own <form> after setting (requestSubmit,
+    so validation + onsubmit still fire) — saves a snapshot + click.
+
     Ex: set_fields('t0', {'input[name=firstname]': 'Gabriel',
                           'input[name=email]': 'a@b.c',
                           'input[name=gdpr]': True,
                           'select[name=lang]': 'Fluent'})
-        → {"ok":true,"set":[...],"failed":[]}"""
-    return _compact(await tab_utils.set_fields(_get_tab(tab_id), fields))
+        → {"ok":true,"now":{"input[name=email]":"a@b.c",...},"failed":{}}
+    Ex: set_fields('t0', {'3': 'Gabriel', '12': True}, submit=True)"""
+    drv = _get_aria(tab_id)
+    resolved: dict[str, Any] = {}
+    key_of: dict[str, str] = {}   # selector → original key, for the report
+    unresolved: dict[str, str] = {}
+    for key, value in fields.items():
+        k = str(key).strip()
+        if k.lstrip("-").isdigit():
+            sel = await drv.selector_for(int(k))
+            if not sel:
+                unresolved[k] = f"idx {k} not in the current snapshot — re-snapshot"
+                continue
+        else:
+            sel = k
+        resolved[sel] = value
+        key_of[sel] = k
+    res = await tab_utils.set_fields(_get_tab(tab_id), resolved,
+                                     submit=submit) if resolved else {
+        "ok": False, "results": {}}
+    now: dict[str, Any] = {}
+    failed: dict[str, str] = dict(unresolved)
+    for sel, r in (res.get("results") or {}).items():
+        key = key_of.get(sel, sel)
+        if isinstance(r, dict) and r.get("ok"):
+            if "checked" in r:
+                # A radio's useful readback is WHICH option is on; a checkbox's
+                # is simply whether it is ticked. Reporting a checkbox's value
+                # attribute ("2", "3") reads like an error code, not success.
+                val = r.get("value")
+                now[key] = (val if r.get("kind") == "radio" and r["checked"]
+                            and val and val != "on" else r["checked"])
+            else:
+                now[key] = r.get("text", r.get("value"))
+        else:
+            why = r.get("why", "failed") if isinstance(r, dict) else str(r)
+            if isinstance(r, dict) and r.get("options"):
+                why += " — options: " + ", ".join(r["options"][:12])
+            failed[key] = why
+    out: dict[str, Any] = {"ok": not failed, "now": now, "failed": failed}
+    if submit:
+        out["submitted"] = res.get("submitted", False)
+    if verbose:
+        out["results"] = res.get("results", {})
+    return _compact(out)
 
 
 @mcp.tool()

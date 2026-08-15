@@ -163,6 +163,18 @@ _SET_FIELD_JS = r"""
   const truthy = v => v === true || v === 'true' || v === 1 || v === '1'
                    || v === 'on' || v === 'yes' || v === 'checked';
 
+  const setChecked = (node, want) => {
+    const proto = Object.getPrototypeOf(node);
+    const desc = Object.getOwnPropertyDescriptor(proto, 'checked')
+              || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked');
+    if (node.checked !== want) {
+      if (desc && desc.set) desc.set.call(node, want); else node.checked = want;
+      fire(node, ['click', 'input', 'change']);
+    }
+    return {ok: node.checked === want, kind: (node.type || '').toLowerCase(),
+            checked: node.checked, value: node.value};
+  };
+
   if (tag === 'SELECT') {
     // Accept the option's value OR its visible text, like a human would.
     const want = String(raw);
@@ -179,15 +191,30 @@ _SET_FIELD_JS = r"""
   }
 
   if (type === 'checkbox' || type === 'radio') {
-    const want = truthy(raw);
-    const proto = Object.getPrototypeOf(el);
-    const desc = Object.getOwnPropertyDescriptor(proto, 'checked')
-              || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked');
-    if (el.checked !== want) {
-      if (desc && desc.set) desc.set.call(el, want); else el.checked = want;
-      fire(el, ['click', 'input', 'change']);
+    // A string that isn't a boolean token means "pick the group member with
+    // this value/label" — `{size: 'medium'}` is what a caller naturally
+    // writes. Silently coercing it to false used to UNCHECK the box and
+    // still report ok, so a wrong option looked like a successful fill.
+    const falsy = v => v === false || v === 'false' || v === 0 || v === '0'
+                    || v === 'off' || v === 'no' || v === 'unchecked';
+    if (typeof raw === 'string' && !truthy(raw) && !falsy(raw)) {
+      const group = el.name && el.form
+        ? Array.from(el.form.querySelectorAll(
+            'input[name="' + el.name + '"]'))
+        : [el];
+      const want = raw.trim().toLowerCase();
+      const labelOf = n => {
+        const lab = n.labels && n.labels[0];
+        return ((lab && lab.textContent) || n.value || '').trim().toLowerCase();
+      };
+      const hit = group.find(n => (n.value || '').trim().toLowerCase() === want)
+               || group.find(n => labelOf(n) === want)
+               || group.find(n => labelOf(n).includes(want));
+      if (!hit) return {ok: false, why: 'no option matches ' + JSON.stringify(raw),
+                        options: group.map(n => n.value || labelOf(n)).slice(0, 25)};
+      return setChecked(hit, true);
     }
-    return {ok: el.checked === want, kind: type, checked: el.checked};
+    return setChecked(el, truthy(raw));
   }
 
   if (el.isContentEditable) {
@@ -246,13 +273,18 @@ async def set_field(tab: Any, selector: str, value: Any) -> dict[str, Any]:
     return _json_result(raw)
 
 
-async def set_fields(tab: Any, fields: dict[str, Any]) -> dict[str, Any]:
+async def set_fields(tab: Any, fields: dict[str, Any],
+                     submit: bool = False) -> dict[str, Any]:
     """Set many form fields in ONE round-trip. Same semantics as `set_field`.
 
     `fields` maps CSS selector → value. A ten-field form is one evaluate call
     instead of ten, which matters more than it looks: each MCP round-trip is
     framing + scheduling overhead, and interleaving them with re-snapshots is
     how a form that should take two seconds takes thirty.
+
+    `submit=True` submits the owning <form> of the last field set, via
+    requestSubmit() so HTML validation and onsubmit handlers still run (plain
+    form.submit() skips both, which real sites notice).
 
     Returns {selector: result} plus rolled-up ok/failed lists.
     """
@@ -261,18 +293,32 @@ async def set_fields(tab: Any, fields: dict[str, Any]) -> dict[str, Any]:
         const setOne = {_SET_FIELD_JS};
         const fields = {payload};
         const out = {{}};
+        let lastEl = null;
         for (const [sel, val] of Object.entries(fields)) {{
-            try {{ out[sel] = setOne(sel, val); }}
+            try {{
+                out[sel] = setOne(sel, val);
+                if (out[sel] && out[sel].ok) lastEl = document.querySelector(sel);
+            }}
             catch (e) {{ out[sel] = {{ok: false, why: String(e)}}; }}
         }}
-        return out;
+        let submitted = false;
+        if ({json.dumps(bool(submit))} && lastEl) {{
+            const form = lastEl.form || lastEl.closest('form');
+            if (form) {{
+                if (form.requestSubmit) form.requestSubmit(); else form.submit();
+                submitted = true;
+            }}
+        }}
+        return {{_fields: out, _submitted: submitted}};
     }})())"""
     result = _json_result(await tab.evaluate(script))
     if result.get("why"):
         return result
-    ok = [s for s, r in result.items() if isinstance(r, dict) and r.get("ok")]
-    failed = [s for s, r in result.items() if not (isinstance(r, dict) and r.get("ok"))]
-    return {"ok": not failed, "set": ok, "failed": failed, "results": result}
+    per_field = result.get("_fields", {})
+    ok = [s for s, r in per_field.items() if isinstance(r, dict) and r.get("ok")]
+    failed = [s for s, r in per_field.items() if not (isinstance(r, dict) and r.get("ok"))]
+    return {"ok": not failed, "set": ok, "failed": failed, "results": per_field,
+            "submitted": result.get("_submitted", False)}
 
 
 async def get_response_body(tab: Any, request_id: str) -> dict[str, Any]:
