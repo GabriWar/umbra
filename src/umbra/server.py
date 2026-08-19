@@ -2223,7 +2223,10 @@ async def web_search(query: str, dorks: list[str] | None = None,
                      time_range: Literal["day", "week", "month", "year"] | None = None,
                      page: int = 1,
                      allowed_domains: list[str] | None = None,
-                     blocked_domains: list[str] | None = None) -> dict[str, Any]:
+                     blocked_domains: list[str] | None = None,
+                     proxy: str | None = None, use_proxy_pool: bool = True,
+                     proxy_country: str | None = None, proxy_tag: str | None = None,
+                     ) -> dict[str, Any]:
     """Meta-search, no API keys. Engines: duckduckgo+bing+brave (HTTP, Chrome JA3) by default;
     add 'google' + pass `tab_id` to drive Google through a live stealth tab (best quality;
     spawn one first). Auto-dorks: classifies intent → site:/filetype:/inurl:/intitle:
@@ -2233,17 +2236,25 @@ async def web_search(query: str, dorks: list[str] | None = None,
     silently ignore operators). Pass `dorks` to supply your own variants; auto_dork=False
     for a plain query. Env: BRAVE_API_KEY (brave via API, no 429s), UMBRA_SEARXNG_URL
     (adds 'searxng' engine). Then `tls_fetch` / `extract_markdown` the hits.
+    Proxy: HTTP engines egress via `proxy=` URL, else a pool entry if `proxy_pool_load`
+    was called (use_proxy_pool=True default; proxy_country/proxy_tag filter), else direct.
+    Google engine uses its tab's proxy. Response `proxy:true` when one was used.
 
     Ex: web_search('fastmcp tool decorator docs') → {"intent":"docs","dorks":[...],"engines":{"bing":20,...},
         "results":[{"url":...,"title":...,"snippet":...,"score":3.4,"engines":["bing","brave"],"dork":"..."}]}
     Ex: web_search('x230 coreboot', engines=['google','bing'], tab_id='t0')"""
     from umbra.search import search
+    pool = _state.get("proxy_pool")
+    if proxy is None and use_proxy_pool and pool is not None and len(pool) > 0:
+        entry = await pool.acquire("web_search", country=proxy_country, tag=proxy_tag,
+                                   exclusive=False)
+        proxy = entry.auth_url()
     return _compact(await search(
         query, dorks=dorks, intent=intent, auto_dork=auto_dork, engines=engines,
         google_tab=_get_tab(tab_id) if tab_id else None,
         max_results=max_results, max_per_host=max_per_host, language=language,
         time_range=time_range, page=page, allowed_domains=allowed_domains,
-        blocked_domains=blocked_domains))
+        blocked_domains=blocked_domains, proxy=proxy))
 
 
 # ═════════════════════════════════════════════════════════════════════════

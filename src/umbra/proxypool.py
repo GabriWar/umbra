@@ -88,6 +88,14 @@ class ProxyEntry:
             netloc += f":{p.port}"
         return _up.urlunparse((p.scheme, netloc, p.path, p.params, p.query, p.fragment))
 
+    def auth_url(self) -> str:
+        """Full proxy URL incl. creds — for curl_cffi / requests `proxies=`."""
+        base = self.chrome_flag_url()
+        if self.username and self.password:
+            p = _up.urlparse(base)
+            return f"{p.scheme}://{self.effective_username()}:{self.password}@{p.hostname}:{p.port}"
+        return base
+
     def to_dict(self, *, redact: bool = True) -> dict[str, Any]:
         d: dict[str, Any] = {
             "id": self.id,

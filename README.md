@@ -327,6 +327,8 @@ A port of the useful half of searxng — the engines and the result aggregation 
 2. **engines** — `duckduckgo` + `bing` + `brave` scraped over `curl_cffi` (Chrome JA3); `google` driven through a live umbra tab (pass `tab_id`; paced 1.5–3s between queries — ~5 back-to-back trips `/sorry/`, then `handoff_start`). Each engine only receives the dorks it honors (ddg lite 202s on `filetype:`/`inurl:`), and hits that violate a dork's operators are dropped — engines silently ignore operators and return generic junk otherwise.
 3. **merge** — searxng-style: normalize URL (`www.`, trailing `/`, fragment), score = Σ over every (dork, engine) list the URL appears in of `specificity × dork_order × engine_weight / position`, junk domains dropped, per-host cap, `allowed_domains` / `blocked_domains`.
 
+Proxies: HTTP engines egress through `proxy=` or, after `proxy_pool_load`, a pool entry (default; `proxy_country`/`proxy_tag` filter). Google uses its tab's proxy.
+
 Env: `BRAVE_API_KEY` → brave via the official API (no 429s, 2k/mo free). `UMBRA_SEARXNG_URL` → adds a `searxng` engine if you run one anyway.
 
 ### multi-browser orchestration

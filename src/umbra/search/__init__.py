@@ -11,7 +11,7 @@ import asyncio
 from typing import Any
 
 from .dorks import INTENTS, build_dorks, classify_intent, hit_satisfies, operators_of
-from .engines import HTTP_ENGINES, SUPPORTS, WEIGHTS, Engine, google_browser
+from .engines import HTTP_ENGINES, PROXY, SUPPORTS, WEIGHTS, Engine, google_browser
 from .results import merge
 
 __all__ = ["INTENTS", "search", "HTTP_ENGINES", "google_browser"]
@@ -25,7 +25,11 @@ async def search(query: str, *, dorks: list[str] | None = None, intent: str | No
                  language: str = "en", time_range: str | None = None, page: int = 1,
                  allowed_domains: list[str] | None = None,
                  blocked_domains: list[str] | None = None,
+                 proxy: str | None = None,
                  per_engine_concurrency: int = 1) -> dict[str, Any]:
+    """`proxy`: URL (http/https/socks5, creds inline) used by every HTTP engine
+    call in this search. Google uses whatever proxy its tab was spawned with."""
+    PROXY.set(proxy)
     intent = intent or classify_intent(query)
     if dorks:
         dl = [{"query": q, "operators": operators_of(q)} for q in dorks]
@@ -81,7 +85,7 @@ async def search(query: str, *, dorks: list[str] | None = None, intent: str | No
 
     return {
         "query": query, "intent": intent, "dorks": [d["query"] for d in dl],
-        "engines": counts,
+        "engines": counts, "proxy": bool(proxy),
         "results": merge(sources, weights=WEIGHTS, max_results=max_results,
                          max_per_host=max_per_host, allowed_domains=allowed_domains,
                          blocked_domains=blocked_domains),

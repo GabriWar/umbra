@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import html
 import logging
 import os
@@ -53,8 +54,16 @@ def _first(els: list[Any]) -> Any:
     return els[0] if els else None
 
 
+# Proxy for all HTTP engines in the current search() call (set via contextvar
+# so engine signatures stay clean). curl_cffi honors http/https/socks5 URLs.
+PROXY: contextvars.ContextVar[str | None] = contextvars.ContextVar("umbra_search_proxy", default=None)
+
+
 async def _http(method: str, url: str, **kw: Any) -> Any:
     from curl_cffi import requests as cc
+    proxy = PROXY.get()
+    if proxy and "api.search.brave.com" not in url:  # API calls don't need egress rotation
+        kw.setdefault("proxies", {"http": proxy, "https": proxy})
     kw.setdefault("impersonate", _IMPERSONATE)
     kw.setdefault("timeout", TIMEOUT)
     kw["headers"] = {**_HDRS, **kw.get("headers", {})}
