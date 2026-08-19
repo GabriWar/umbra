@@ -26,6 +26,7 @@ dependencies = [
     "cryptography>=42", # encrypted session save/load (umbra.session)
     "websockets>=13", # handoff remote-view server (also transitive via nodriver)
     "curl-cffi>=0.15.0",
+    "lxml>=5", # web_search engine HTML parsing (umbra.search)
 ]
 
 [project.optional-dependencies]

@@ -20,6 +20,7 @@
   Stealth            check_detection / warm_session / rotate_fingerprint
   Handoff            handoff_start / handoff_wait / request_user_input  (live remote view → user solves → resume)
   TLS                tls_fetch  (raw HTTP w/ Chrome JA3, skip browser entirely)
+  Search             web_search  (built-in meta-search: dorks × ddg/bing/brave/google → ranked)
   Session            session_save / session_load / session_list / session_delete
   Meta               set_verbosity / list_browsers / kill_all / close_browser
 
@@ -2205,6 +2206,44 @@ async def tls_fetch(url: str, method: str = "GET",
         "headers": dict(r.headers),
         "body": text,
     }, max_str=max_chars)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Web search — built-in meta-search (dorks × engines → ranked)
+# ═════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+async def web_search(query: str, dorks: list[str] | None = None,
+                     intent: Literal["code", "docs", "pdf", "dataset", "forum",
+                                     "news", "firmware", "generic"] | None = None,
+                     auto_dork: bool = True,
+                     engines: list[str] | None = None, tab_id: str | None = None,
+                     max_results: int = 10, max_per_host: int = 3,
+                     language: str = "en",
+                     time_range: Literal["day", "week", "month", "year"] | None = None,
+                     page: int = 1,
+                     allowed_domains: list[str] | None = None,
+                     blocked_domains: list[str] | None = None) -> dict[str, Any]:
+    """Meta-search, no API keys. Engines: duckduckgo+bing+brave (HTTP, Chrome JA3) by default;
+    add 'google' + pass `tab_id` to drive Google through a live stealth tab (best quality;
+    spawn one first). Auto-dorks: classifies intent → site:/filetype:/inurl:/intitle:
+    variants + raw baseline → concurrent fan-out → searxng-style merge: Σ over
+    (dork,engine) of specificity×weight/position, dedupe by normalized URL, drop junk
+    domains, cap per host. Hits violating a dork's operators are discarded (engines
+    silently ignore operators). Pass `dorks` to supply your own variants; auto_dork=False
+    for a plain query. Env: BRAVE_API_KEY (brave via API, no 429s), UMBRA_SEARXNG_URL
+    (adds 'searxng' engine). Then `tls_fetch` / `extract_markdown` the hits.
+
+    Ex: web_search('fastmcp tool decorator docs') → {"intent":"docs","dorks":[...],"engines":{"bing":20,...},
+        "results":[{"url":...,"title":...,"snippet":...,"score":3.4,"engines":["bing","brave"],"dork":"..."}]}
+    Ex: web_search('x230 coreboot', engines=['google','bing'], tab_id='t0')"""
+    from umbra.search import search
+    return _compact(await search(
+        query, dorks=dorks, intent=intent, auto_dork=auto_dork, engines=engines,
+        google_tab=_get_tab(tab_id) if tab_id else None,
+        max_results=max_results, max_per_host=max_per_host, language=language,
+        time_range=time_range, page=page, allowed_domains=allowed_domains,
+        blocked_domains=blocked_domains))
 
 
 # ═════════════════════════════════════════════════════════════════════════

@@ -1782,6 +1782,7 @@ dependencies = [
     { name = "cryptography" },
     { name = "curl-cffi" },
     { name = "fastmcp" },
+    { name = "lxml" },
     { name = "nodriver" },
     { name = "websockets" },
 ]
@@ -1815,6 +1816,7 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'sessions'", specifier = ">=42" },
     { name = "curl-cffi", specifier = ">=0.15.0" },
     { name = "fastmcp", specifier = ">=2.0" },
+    { name = "lxml", specifier = ">=5" },
     { name = "markdownify", marker = "extra == 'all'", specifier = ">=0.13" },
     { name = "markdownify", marker = "extra == 'markdown'", specifier = ">=0.13" },
     { name = "nodriver", specifier = ">=0.47.0" },

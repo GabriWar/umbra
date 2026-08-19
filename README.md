@@ -28,6 +28,7 @@ Built by merging the best parts of [obscura](https://github.com/h4ckf0r0day/obsc
 | **token efficiency** | **75% tokens / 83% bytes saved** vs raw output, [measured](#-token-efficiency) over 79 calls |
 | **proxy support** | pool w/ 5 rotation strategies, CDP auth (any provider), sticky sessions, geo filters |
 | **handoff** | live remote-view via `cloudflared` Quick Tunnel (works VPS → home laptop) |
+| **web search** | built-in meta-search: auto-dorks × ddg/bing/brave/google → merged, ranked, deduped. no API keys, no searxng server |
 | **CDP schema drift** | resilient — survives Chrome field churn (e.g. dropped `sameParty`) without hangs |
 
 ---
@@ -304,6 +305,30 @@ tls_fetch('https://api.example.com/users')
 
 curl_cffi pinned to running Chrome version — JA3+JA4+HTTP/2 SETTINGS frames match Chrome exactly. ~50ms vs ~500ms via spawn+navigate.
 
+### `web_search` — meta-search with dorks, no API keys
+
+```python
+web_search('thinkpad x230 coreboot firmware')
+# → {"intent": "firmware",
+#    "dorks": ["thinkpad x230 coreboot firmware (site:github.com OR site:gitlab.com ...) -amazon.com -ebay.com",
+#              "thinkpad x230 coreboot firmware filetype:bin ...", ..., "thinkpad x230 coreboot firmware"],
+#    "engines": {"duckduckgo": 10, "bing": 20, "brave": 28},
+#    "results": [{"url": "https://github.com/0xbb/coreboot-x230", "title": "...", "snippet": "...",
+#                 "score": 3.47, "engines": ["bing","brave","duckduckgo"], "dork": "..."}, ...]}
+
+web_search('fastmcp tool decorator', engines=['google', 'bing'], tab_id='t0')   # google via a live stealth tab
+web_search('rust async runtime', dorks=['rust async runtime site:docs.rs', 'tokio vs async-std'])  # your own dorks
+web_search('ubuntu 24.04 release', time_range='month', blocked_domains=['reddit.com'], max_results=5)
+```
+
+A port of the useful half of searxng — the engines and the result aggregation — plus a dork layer:
+
+1. **dorks** — intent classified from keywords (`code/docs/pdf/dataset/forum/news/firmware`) → `site:` / `filetype:` / `inurl:` / `intitle:` variants + the raw query as baseline. Pass `dorks=[...]` to supply your own (you're the LLM), `auto_dork=False` for a plain query.
+2. **engines** — `duckduckgo` + `bing` + `brave` scraped over `curl_cffi` (Chrome JA3); `google` driven through a live umbra tab (pass `tab_id`; paced 1.5–3s between queries — ~5 back-to-back trips `/sorry/`, then `handoff_start`). Each engine only receives the dorks it honors (ddg lite 202s on `filetype:`/`inurl:`), and hits that violate a dork's operators are dropped — engines silently ignore operators and return generic junk otherwise.
+3. **merge** — searxng-style: normalize URL (`www.`, trailing `/`, fragment), score = Σ over every (dork, engine) list the URL appears in of `specificity × dork_order × engine_weight / position`, junk domains dropped, per-host cap, `allowed_domains` / `blocked_domains`.
+
+Env: `BRAVE_API_KEY` → brave via the official API (no 429s, 2k/mo free). `UMBRA_SEARXNG_URL` → adds a `searxng` engine if you run one anyway.
+
 ### multi-browser orchestration
 
 ```python
@@ -368,6 +393,8 @@ Match DSL: `url_pattern`, `url_regex`, `method`, `resource_type`, `header_match`
                   ├─ files              upload_file / setup_downloads / wait_for_download
                   │
                   ├─ TLS                tls_fetch  (raw HTTP w/ Chrome JA3+JA4)
+                  │
+                  ├─ search             web_search  (dorks × ddg/bing/brave/google → ranked)
                   │
                   └─ batch ⭐ flagship  batch  (N tools in one round-trip; composes w/ dedup)
 ```
