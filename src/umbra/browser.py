@@ -91,6 +91,31 @@ def _detect_chrome_version(chrome_path: str | None) -> str:
     return fallback
 
 
+def _assert_profile_free(user_data_dir: str) -> None:
+    """Refuse to launch on a profile another Chrome already holds.
+
+    Chrome guards a profile with a SingletonLock symlink; a second process
+    pointed at the same directory either bounces the request to the running
+    instance or dies, and nodriver then waits on a debug port that never
+    opens. Failing here says which directory is busy instead.
+    """
+    lock = os.path.join(user_data_dir, "SingletonLock")
+    if not os.path.islink(lock) and not os.path.exists(lock):
+        return
+    holder = ""
+    with contextlib.suppress(OSError):
+        holder = os.readlink(lock)          # "hostname-<pid>"
+    pid = holder.rsplit("-", 1)[-1] if "-" in holder else ""
+    if pid.isdigit() and os.path.exists(f"/proc/{pid}"):
+        raise RuntimeError(
+            f"profile {user_data_dir!r} is in use by a running Chrome (pid {pid}) "
+            f"— close that Chrome, or copy the profile directory and point at "
+            f"the copy"
+        )
+    log.info("stale SingletonLock in %s (no live holder) — launching anyway",
+             user_data_dir)
+
+
 def _build_ua(version: str) -> str:
     """Linux Chrome UA matching the detected version. No 'HeadlessChrome'."""
     return (
@@ -247,6 +272,13 @@ class StealthOptions:
     # Process
     headless: bool = False          # default False — most stealth assumes a display
     user_data_dir: str | None = None
+    # Which profile inside user_data_dir to open ('Default', 'Profile 1', …).
+    # Chrome's own flag name, kept verbatim so it matches what users see in
+    # chrome://version under "Profile Path".
+    profile_directory: str | None = None
+    # Short names from umbra.extensions.KNOWN ('ublock-lite'). Loading one
+    # forces a visible window — Chrome ignores --load-extension in headless.
+    extensions: list[str] = field(default_factory=list)
     chrome_path: str | None = None  # nodriver auto-detects if None
     extra_args: list[str] = field(default_factory=list)
     window_size: tuple[int, int] = (1920, 1080)
@@ -539,6 +571,25 @@ class StealthBrowser:
             flags.append("--no-sandbox")
             flags.append("--disable-dev-shm-usage")
             log.info("Container/root detected — sandbox disabled")
+
+        if opts.extensions:
+            from umbra.extensions import ensure as _ensure_ext
+            paths = [str(_ensure_ext(n)) for n in opts.extensions]
+            flags.append("--load-extension=" + ",".join(paths))
+            # Real Chrome ships this on; the base flag set turned it off, and
+            # a blocker that never runs is worse than none.
+            flags[:] = [f for f in flags if f != "--disable-extensions"]
+            if opts.headless:
+                log.warning("extensions %s requested — headless disabled, Chrome "
+                            "drops --load-extension without a window",
+                            opts.extensions)
+                opts.headless = False
+                flags[:] = [f for f in flags if f not in _HEADLESS_GPU_FLAGS]
+
+        if opts.user_data_dir:
+            _assert_profile_free(opts.user_data_dir)
+            if opts.profile_directory:
+                flags.append(f"--profile-directory={opts.profile_directory}")
 
         config = uc.Config(
             headless=opts.headless,

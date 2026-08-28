@@ -143,6 +143,8 @@ class AriaDriver:
     def __init__(self, tab: Any):
         self.tab = tab
         self._index: dict[int, AxNode] = {}
+        self._parent_of: dict[str, str] = {}
+        self._node_of_backend: dict[int, str] = {}
         self._cdp = uc.cdp
 
     async def snapshot(self) -> list[AxNode]:
@@ -171,6 +173,21 @@ class AriaDriver:
             if isinstance(thing, dict):
                 return thing.get("value", default)
             return thing
+
+        # Ancestry for EVERY node, interactive or not: `within=` scopes a
+        # snapshot to one container, and containers are usually generic divs
+        # that never make the interactive list themselves.
+        self._parent_of, self._node_of_backend = {}, {}
+        for raw in nodes:
+            nid = getattr(raw, "node_id", None) or getattr(raw, "nodeId", 0)
+            pid = getattr(raw, "parent_id", None) or getattr(raw, "parentId", None)
+            bid = (getattr(raw, "backend_dom_node_id", None)
+                   or getattr(raw, "backendDOMNodeId", None))
+            if nid:
+                if pid:
+                    self._parent_of[str(nid)] = str(pid)
+                if bid:
+                    self._node_of_backend[int(bid)] = str(nid)
 
         interactive: list[AxNode] = []
         for raw in nodes:
@@ -209,9 +226,50 @@ class AriaDriver:
         self._index = {n.idx: n for n in interactive}
         return interactive
 
+    def _is_descendant(self, node: AxNode, root_node_id: str) -> bool:
+        """Walk an AX node's ancestry looking for `root_node_id`."""
+        seen, cur = set(), str(node.node_id)
+        while cur and cur not in seen:
+            if cur == root_node_id:
+                return True
+            seen.add(cur)
+            cur = self._parent_of.get(cur, "")
+        return False
+
+    async def scope_to(self, target: str) -> tuple[str | None, str | None]:
+        """Resolve a container to the AX node id that roots its subtree.
+
+        `target` is a CSS selector, or an existing snapshot idx. Returns
+        (node_id, error) — the caller reports the error rather than silently
+        snapshotting the whole page, which is what makes a scoped snapshot
+        trustworthy.
+        """
+        if target.strip().lstrip("-").isdigit():
+            node = self._index.get(int(target))
+            if not node:
+                return None, f"idx {target} is not in the current snapshot"
+            return str(node.node_id), None
+        try:
+            doc = await self.tab.send(self._cdp.dom.get_document())
+            dom_id = await self.tab.send(self._cdp.dom.query_selector(
+                node_id=doc.node_id, selector=target))
+            if not dom_id:
+                return None, f"no element matches {target!r}"
+            described = await self.tab.send(self._cdp.dom.describe_node(node_id=dom_id))
+            desc = described[0] if isinstance(described, tuple) else described
+            backend = getattr(desc, "backend_node_id", None)
+        except Exception as e:  # noqa: BLE001
+            return None, f"could not resolve {target!r}: {str(e)[:120]}"
+        root = self._node_of_backend.get(int(backend)) if backend else None
+        if not root:
+            return None, (f"{target!r} exists in the DOM but has no accessibility "
+                          f"node — scope to a parent, or drop `within`")
+        return root, None
+
     def render_tree(self, max_items: int = 60,
                     only: frozenset[str] | set[str] | None = None,
-                    extra: dict[int, dict[str, Any]] | None = None) -> str:
+                    extra: dict[int, dict[str, Any]] | None = None,
+                    keep: set[int] | None = None) -> str:
         """Pretty-print the snapshot for an LLM, with run-length grouping.
 
         Detects repeating cycles of (role, name) signatures across consecutive
@@ -219,9 +277,11 @@ class AriaDriver:
         and any idx in the range can still be used by `aria_click` / `aria_type`.
 
         `only` keeps just those roles (indexes are untouched, so a filtered
-        tree still drives every idx-based tool); `extra` appends per-idx field
-        detail from `describe_fields`. Both default off — the unfiltered tree
-        is what a caller gets unless they ask for less.
+        tree still drives every idx-based tool); `keep` narrows to a set of
+        indexes, which is how a caller scopes to one container's subtree;
+        `extra` appends per-idx field detail from `describe_fields`. All
+        default off — the unfiltered tree is what a caller gets unless they
+        ask for less.
 
         Output examples:
           [12-77] cycle×13: link("Comments"), link("Permalink"), link("Save"),
@@ -234,7 +294,9 @@ class AriaDriver:
         if not self._index:
             return "(no interactive elements — page may still be loading)"
 
-        nodes = [n for n in self._index.values() if only is None or n.role in only]
+        nodes = [n for n in self._index.values()
+                 if (only is None or n.role in only)
+                 and (keep is None or n.idx in keep)]
         nodes = nodes[:max_items]
 
         def sig(n: "AxNode") -> tuple[str, str]:

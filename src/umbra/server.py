@@ -455,6 +455,9 @@ async def spawn(
     proxy_country: str | None = None,
     proxy_tag: str | None = None,
     chromium: str = "cloak",
+    user_data_dir: str | None = None,
+    profile_directory: str | None = None,
+    extensions: list[str] | None = None,
 ) -> dict[str, Any]:
     """Open stealth tab. browser_id='alice'=isolated Chrome (own cookies/identity, ~1.5s boot).
     For same-identity new pages prefer `navigate` (cheaper). stealth_mode='minimal'
@@ -470,6 +473,24 @@ async def spawn(
     Ex: spawn('about:blank', browser_id='alice', proxy='http://1.2.3.4:8080')
     Ex: spawn(use_proxy_pool=True, proxy_country='US', browser_id='scraper-1')
 
+    `user_data_dir`: launch on an EXISTING Chrome profile, so the session
+    arrives already logged in (plus its cookies, history and extensions).
+    Point it at the "Profile Path" from chrome://version minus the trailing
+    profile folder, and name that folder in `profile_directory` ('Default',
+    'Profile 1'). Chrome allows one process per profile, so your own Chrome
+    must be closed first — otherwise spawn says which pid holds it. Copy the
+    directory and use the copy to keep both running. Without this a throwaway
+    profile is created per browser (`session_save`/`session_load` carry
+    cookies between those).
+
+    `extensions=['ublock-lite']`: load uBlock Origin Lite (fetched from the
+    Web Store on first use, cached under ~/.umbra/extensions). The built-in
+    blocklist already stops tracker REQUESTS; this one hides what is already
+    on the page — ad slots, cookie walls, overlays — the things that shove a
+    form around mid-click. Forces a visible window (Chrome ignores extensions
+    in headless) and is itself a fingerprint tell, so leave it off for
+    stealth-sensitive targets.
+
     chromium: 'cloak' (default) auto-downloads CloakBrowser's patched chromium
     (C++ fingerprint patches — beats JS shims). 'stock'=system chromium.
     Pass an absolute path to use a custom binary. Env: UMBRA_NO_CLOAK=1 forces
@@ -481,9 +502,15 @@ async def spawn(
         headless=headless, low_memory=low_memory, stealth_mode=stealth_mode,
         timezone=timezone, proxy=proxy, user_agent=user_agent,
         proxy_pool=pool, proxy_country=proxy_country, proxy_tag=proxy_tag,
-        chromium=chromium,
+        chromium=chromium, user_data_dir=user_data_dir,
+        profile_directory=profile_directory,
+        extensions=list(extensions or []),
     )
     bid, browser = await _get_or_create_browser(browser_id, opts)
+    # Off the critical path: a weekly look for newer cloak/extension builds.
+    # Whatever it finds lands for the NEXT spawn — this one never waits.
+    from umbra import updates as _updates
+    _updates.kick_background_check()
     tab = await browser.new_tab(url)
     n = _state["next_tab_n"]
     _state["next_tab_n"] = n + 1
@@ -902,7 +929,8 @@ async def reload(tab_id: str, hard: bool = False) -> dict[str, Any]:
 async def aria_snapshot(tab_id: str, max_items: int = 60,
                           force_refresh: bool = False,
                           only: str | None = None,
-                          fields: bool = False) -> dict[str, Any]:
+                          fields: bool = False,
+                          within: str | None = None) -> dict[str, Any]:
     """ARIA tree of interactive elements w/ `idx` for click/type. ~50ms. Call BEFORE
     first interaction + after any DOM change (idx invalidates). Repeats group as
     `[12-77] cycle×13: link('A'),link('B')` (lossless — click any idx in range).
@@ -917,11 +945,21 @@ async def aria_snapshot(tab_id: str, max_items: int = 60,
     `<select>` options the AX tree alone never tells you. Costs one CDP call
     per field, no extra round-trip, and saves guessing a selector or a format.
 
+    `within`: scope the tree to ONE container — a CSS selector, or an idx
+    from the current snapshot. When the page's real content is a dialog or a
+    single panel, this keeps the surrounding chrome (nav, ads, cookie bars)
+    out of the reply. Indexes stay global, so scoping never renumbers them.
+
     Ex: aria_snapshot('t0') → {"tree":"[0] button \\"Sign in\\"\\n[1] textbox \\"email\\"\\n...","count":12}
     Ex: aria_snapshot('t0', only='form', fields=True)
         → {"tree":"[3] textbox \\"First Name\\" {sel=#firstName type=text required}",...}"""
     drv = _get_aria(tab_id)
     nodes = await drv.snapshot()
+    if within:
+        scope, why = await drv.scope_to(within)
+        if why:
+            return _compact({"error": why})
+        nodes = [n for n in nodes if drv._is_descendant(n, scope)]
     roles: frozenset[str] | None = None
     if only:
         wanted = {r.strip().lower() for r in only.split(",") if r.strip()}
@@ -938,7 +976,9 @@ async def aria_snapshot(tab_id: str, max_items: int = 60,
                    if n.role in _FIELD_ROLES
                    and (roles is None or n.role in roles)]
         extra = await drv.describe_fields(targets[:max_items])
-    tree = drv.render_tree(max_items=max_items, only=roles, extra=extra)
+    keep = {n.idx for n in nodes} if within else None
+    tree = drv.render_tree(max_items=max_items, only=roles, extra=extra,
+                           keep=keep)
     if fields:
         # Widgets with no ARIA role are absent from the tree entirely, so a
         # caller reads "the field isn't there" and starts digging through raw
@@ -953,7 +993,7 @@ async def aria_snapshot(tab_id: str, max_items: int = 60,
     }, max_str=8000 if fields else 4000)
     return _maybe_dedup(tab_id, "aria_snapshot",
                          {"tab_id": tab_id, "max_items": max_items,
-                          "only": only, "fields": fields},
+                          "only": only, "fields": fields, "within": within},
                          data, force_refresh=force_refresh)
 
 
@@ -2531,6 +2571,30 @@ async def cleanup_stale(idle_seconds: float = 600.0) -> dict[str, Any]:
 # DL'd from CloakHQ/CloakBrowser GH releases, sha256-verified, cached under
 # ~/.umbra/cloak/<tag>/. License = no redistribute, so umbra never bundles.
 # ═════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def update_status(check_now: bool = False,
+                        download: bool = True) -> dict[str, Any]:
+    """Installed vs latest for the cloak build and any cached extensions.
+
+    A check runs on its own once every UMBRA_UPDATE_EVERY_DAYS (default 7,
+    0 disables), in the background after a spawn, and installs newer builds
+    for the NEXT spawn. `check_now=True` runs it immediately and waits;
+    `download=False` only reports, never installs.
+
+    Ex: update_status() → {"last_check":"2d ago","cloak":{"installed":"chromium-v146…4","latest":"chromium-v146…5"}}
+    Ex: update_status(check_now=True) → {...,"cloak":{"installed":"…5","latest":"…5","updated":true}}"""
+    from umbra import updates as _updates
+    if check_now:
+        rep = await asyncio.to_thread(_updates.check, force=True, download=download)
+    else:
+        rep = {k: v for k, v in _updates.load_state().items() if k != "last_check"}
+    last = _updates.load_state().get("last_check")
+    rep["last_check"] = (f"{int((time.time() - last) / 3600)}h ago" if last
+                         else "never")
+    rep["every_days"] = _updates._every_seconds() / 86400
+    return _compact(rep)
 
 
 @mcp.tool()
