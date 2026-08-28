@@ -486,6 +486,61 @@ Toggle off via `set_verbosity('full')` when you need raw byte-exact output. Loss
 
 ---
 
+## ⚔️ vs claude-in-chrome
+
+Same task, same values, same prompt, same model (sonnet subagent with zero prior context and a call budget), two different toolsets. Each agent kept a verbatim call log; the numbers below are from the transcripts, not the agents' self-reports.
+
+**React form** — [demoqa.com/automation-practice-form](https://demoqa.com/automation-practice-form): react-select ×3, react-datepicker, file upload, confirmation modal.
+
+| | umbra | claude-in-chrome |
+|---|---|---|
+| browser tool calls | **12** | 44 |
+| agent tokens | **50k** | 86k |
+| wall time | **63 s** | 233 s |
+| screenshots | **0** | 13 (892 KB base64) |
+| fields that landed | **10 / 10** | 9 / 10 |
+| "success" reported, nothing happened | **0** | 3 |
+
+**jQuery form** — [demo.automationtesting.in/Register.html](https://demo.automationtesting.in/Register.html): select2, jQuery-UI multiselect with no ARIA role, 3-part date, password confirm.
+
+| | umbra | claude-in-chrome |
+|---|---|---|
+| browser tool calls | **27** | 47 |
+| agent tokens | **78k** | 87k |
+| screenshots | **6** | 11 |
+| fields that landed | 13 / 13 | 13 / 13 |
+| clicks that missed their target | **1** | 4 |
+
+(Both were then blocked by the same page bug — a `required` `<select>` whose only option is the placeholder. Both detected it; neither forced through.)
+
+### why the gap
+
+It is not speed. It is **whether the tool's return value can be trusted**.
+
+claude-in-chrome's `computer(left_click, ref)` on a React radio returned `"Clicked on element ref_139"` — the radio stayed empty. `form_input(ref, true)` on a checkbox returned `"Checkbox checked (previous: false)"`, every screenshot afterwards showed it ticked, and the submitted form had **no hobbies at all**: the DOM attribute flipped, React's state never did. Nothing short of reading the final confirmation table could catch that one.
+
+So the agent did the only rational thing — *"I was forced into a screenshot-after-every-action discipline"* — and switched to pixel coordinates for anything React-flavoured. On the jQuery page the layout shifted a few pixels while the footer loaded, and the same click missed **three times in a row** on stale coordinates, then missed Submit the same way. `"Clicked at (722, 705)"` — reported as success.
+
+umbra's `set_fields` writes through the native prototype setter and fires `click`/`input`/`change`, which is what React's synthetic event system listens for — the same checkboxes landed. Its reply is `now: {…}` — what the field **holds**, not what the tool attempted. `aria_click` acts on element identity, so layout drift is irrelevant, and it reports `navigated: true, url: …` when the click took you somewhere. `combo_select` opens, filters and picks in one call with no window for the menu to unmount between steps. The agent verified once, at the end, against the modal.
+
+### what claude-in-chrome does that umbra does not
+
+Be fair about it:
+
+- **drives your real Chrome, with your real logged-in session** — the structural difference. umbra spawns an isolated Chrome. (`spawn(user_data_dir=…)` now launches on an existing profile, which closes most of the gap, but your own Chrome has to be closed first.)
+- **remote browsers** — `list_connected_browsers` / `switch_browser` drive a Chrome on another machine on the same account.
+- **`gif_creator`** — records the session with click indicators and action labels.
+- **`find` by purpose** — natural-language element lookup ("the add-to-cart button"). umbra's `find_by_text` matches literal text; unlabelled widgets are instead named in the `aria_snapshot(fields=True)` footer.
+- **`shortcuts_*`** — user-defined workflows in the extension.
+
+What umbra has that it does not: route interception & mocking, HAR record/replay, proxy pool, stealth/fingerprint/cloak, `tls_fetch`, session save/load, `set_fields`, `combo_select`, human handoff.
+
+### on method
+
+umbra's numbers are *after* the form-filling work in `bd4f561`. Before it, the same React form cost an umbra agent **59** calls — worse than claude-in-chrome's 44. The comparison measures tool design, not the model, and the fix was found by exactly this loop: give a context-free agent the task, read its call log, fix what it tripped on, repeat. 59 → 27 → 18 → 12.
+
+---
+
 ## 🥷 CloakBrowser (default chromium)
 
 `spawn` defaults to `chromium="cloak"` — when the
