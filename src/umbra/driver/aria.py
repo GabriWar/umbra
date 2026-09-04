@@ -98,6 +98,18 @@ _SELECTOR_JS = """
 """
 
 
+# Flip a toggle the way `set_field` does: through the prototype's own setter,
+# then the events a framework-controlled component listens for.
+_FORCE_TOGGLE_JS = """function() {
+    const d = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked');
+    const want = !this.checked;
+    if (d && d.set) d.set.call(this, want); else this.checked = want;
+    for (const t of ['click', 'input', 'change'])
+        this.dispatchEvent(new Event(t, {bubbles: true}));
+    return this.checked;
+}"""
+
+
 @dataclass
 class AxNode:
     """One element from the accessibility tree."""
@@ -469,10 +481,14 @@ class AriaDriver:
         url_before = None
         with contextlib.suppress(Exception):
             url_before = await self.tab.evaluate("location.href")
+        before_checked: bool | None = None
         is_toggle = node.role in {"checkbox", "radio", "switch"}
         key = "Space" if is_toggle else "Enter"
 
         object_id = await self._object_id(idx)
+
+        if node.role in _TOGGLE_ROLES and object_id:
+            before_checked = await self._read_checked(object_id)
 
         # Does this element plausibly navigate? Asked BEFORE the click, while
         # the context is guaranteed alive, so an ordinary in-page button never
@@ -579,7 +595,36 @@ class AriaDriver:
         if not navigated and url_after and url_before and url_after != url_before:
             navigated, fired = True, True
 
+        # A toggle that reports a click but never changed state is the most
+        # expensive lie this tool can tell. Material-style components own
+        # their state and ignore a synthetic click on the native input: the
+        # click event fires, so `fired` is true, while the box stays as it
+        # was. Verify; if it really did not move, write the value the way
+        # set_field does — native setter plus input/change, which is what
+        # framework-controlled inputs actually listen for.
+        toggled: bool | None = None
+        if node.role in _TOGGLE_ROLES and object_id and not navigated:
+            after = await self._read_checked(object_id)
+            if before_checked is not None and after == before_checked:
+                with contextlib.suppress(Exception):
+                    await self._call_on(object_id, _FORCE_TOGGLE_JS)
+                after = await self._read_checked(object_id)
+                if after != before_checked:
+                    log.debug("aria click idx=%d needed the native-setter path", idx)
+            toggled = after
+            # For a toggle, "ok" can only mean the toggle moved. A click event
+            # that the component swallowed is not a success by any definition
+            # the caller cares about.
+            fired = after != before_checked
+
         out: dict[str, Any] = {"ok": bool(fired), "navigated": navigated}
+        if toggled is not None:
+            out["checked"] = toggled
+            if not fired:
+                out["why"] = (f"the click fired but {node.role!r} stayed "
+                              f"checked={toggled} — the component rejects "
+                              f"programmatic input; try set_field with its "
+                              f"selector, or click_at on its label")
         if navigated:
             if url_after:
                 out["url"] = url_after
@@ -594,6 +639,16 @@ class AriaDriver:
                           "el.click() produced a click event; re-snapshot and "
                           "check the idx")
         return out
+
+    async def _read_checked(self, object_id: str) -> bool | None:
+        """Current on/off state, however the widget chooses to express it."""
+        with contextlib.suppress(Exception):
+            return await self._call_on(object_id, """function() {
+                if (typeof this.checked === 'boolean') return this.checked;
+                const a = this.getAttribute('aria-checked');
+                return a === null ? null : a === 'true';
+            }""")
+        return None
 
     async def rect(self, idx: int, *, scroll_into_view: bool = True) -> dict[str, Any] | None:
         """Viewport rect + center point for an ARIA index.
@@ -743,7 +798,33 @@ class AriaDriver:
                                        "name": n.name[:80], "score": score}))
                 break
         scored.sort(key=lambda t: -t[0])
-        return [d for _, d in scored[:limit]]
+        picked = [d for _, d in scored[:limit]]
+        # Same-label duplicates are the whole reason to call this instead of
+        # find_by_text, and the only question that matters about them is which
+        # one is reachable. Answering it here saves an element_rect per
+        # candidate just to find that out.
+        if len(picked) > 1:
+            best = await self._most_reachable([d["idx"] for d in picked])
+            for d in picked:
+                d["on_screen"] = await self._is_on_screen(d["idx"])
+            picked.sort(key=lambda d: (not d.get("on_screen"), -d["score"]))
+            for d in picked:
+                if d["idx"] == best:
+                    d["best"] = True
+        return picked
+
+    async def _is_on_screen(self, idx: int) -> bool:
+        object_id = await self._object_id(idx)
+        if not object_id:
+            return False
+        with contextlib.suppress(Exception):
+            return bool(await self._call_on(object_id, """function() {
+                const r = this.getBoundingClientRect();
+                return !!(r.width || r.height) && r.bottom > 0 && r.right > 0
+                    && r.top < innerHeight && r.left < innerWidth
+                    && getComputedStyle(this).visibility !== 'hidden';
+            }"""))
+        return False
 
     async def type(self, idx: int, text: str, *, clear: bool = True, jitter: bool = True) -> bool:
         """Focus, optionally clear, then type with humanized log-normal delays."""
@@ -1041,26 +1122,57 @@ class AriaDriver:
         """
         await self.snapshot()
         target = text.lower().strip() if fuzzy else text.strip()
+        exact: list[int] = []
         best_idx, best_score = None, 0
         for n in self._index.values():
             if role_hint and n.role != role_hint:
                 continue
-            haystacks = [n.name, n.value or ""]
-            for hay in haystacks:
+            for hay in (n.name, n.value or ""):
                 if not hay:
                     continue
                 hl = hay.lower() if fuzzy else hay
-                if fuzzy:
-                    if target == hl:
-                        return n.idx
-                    if target in hl:
-                        score = 100 - abs(len(hl) - len(target))
-                        if score > best_score:
-                            best_idx, best_score = n.idx, score
-                else:
-                    if hay == text:
-                        return n.idx
+                if (target == hl) if fuzzy else (hay == text):
+                    exact.append(n.idx)
+                    break
+                if fuzzy and target in hl:
+                    score = 100 - abs(len(hl) - len(target))
+                    if score > best_score:
+                        best_idx, best_score = n.idx, score
+        if len(exact) == 1:
+            return exact[0]
+        if exact:
+            # Real pages carry duplicates of the same label — a dialog's button
+            # and the one still mounted behind it, or a row that scrolled out
+            # of view. Returning whichever came first in the tree hands back an
+            # element that cannot be clicked, and the click then "succeeds"
+            # while nothing happens. Prefer one the user could actually reach.
+            return await self._most_reachable(exact)
         return best_idx
+
+    async def _most_reachable(self, idxs: list[int]) -> int:
+        """Of several same-named elements, the one actually on screen."""
+        ranked: list[tuple[int, int, int]] = []   # (on_screen, rendered, idx)
+        for i in idxs:
+            object_id = await self._object_id(i)
+            if not object_id:
+                ranked.append((0, 0, i))
+                continue
+            try:
+                info = await self._call_on(object_id, """function() {
+                    const r = this.getBoundingClientRect();
+                    const rendered = !!(r.width || r.height)
+                        && getComputedStyle(this).visibility !== 'hidden';
+                    const onScreen = rendered
+                        && r.bottom > 0 && r.right > 0
+                        && r.top < innerHeight && r.left < innerWidth;
+                    return {rendered: rendered, onScreen: onScreen};
+                }""")
+            except Exception:  # noqa: BLE001
+                info = None
+            ranked.append((int(bool(info and info.get("onScreen"))),
+                           int(bool(info and info.get("rendered"))), i))
+        ranked.sort(key=lambda t: (-t[0], -t[1], t[2]))
+        return ranked[0][2]
 
     async def fill_form(self, fields: dict[str, str], *,
                         clear_first: bool = True) -> dict[str, list[str]]:

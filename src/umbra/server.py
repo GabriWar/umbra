@@ -42,6 +42,7 @@ import asyncio
 import base64
 import contextlib
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -335,6 +336,32 @@ def _ledger_key(tab_id: Any, tool: str, args: dict[str, Any]) -> tuple:
     return (tab_id, tool, _j.dumps(args_clean, sort_keys=True, separators=(",", ":")))
 
 
+def _unwrap_cdp(value: Any) -> Any:
+    """Turn CDP's `[[key, {type, value}], …]` pair form back into real data.
+
+    nodriver hands objects back in DevTools' preview shape rather than as
+    values. Left alone it leaks into every `evaluate` result: a three-field
+    object arrives as nine nested lists, unreadable and far bigger than the
+    data it carries.
+    """
+    if isinstance(value, dict):
+        if set(value) <= {"type", "value", "subtype", "className", "description"}:
+            if "value" in value:
+                return _unwrap_cdp(value["value"])
+            return value.get("description", value.get("className"))
+        return {k: _unwrap_cdp(v) for k, v in value.items()}
+    if isinstance(value, list):
+        # A list of [key, wrapped] pairs is an object; anything else is an array.
+        if value and all(isinstance(p, list) and len(p) == 2
+                         and isinstance(p[0], str) for p in value):
+            return {p[0]: _unwrap_cdp(p[1]) for p in value}
+        return [_unwrap_cdp(v) for v in value]
+    return value
+
+
+_NEVER_DEDUP = frozenset({"find_by_text", "find_all_by_text", "element_rect"})
+
+
 def _maybe_dedup(tab_id: Any, tool: str, args: dict[str, Any],
                   response: Any, *, force_refresh: bool = False) -> Any:
     """Wrap a tool's response. If identical to a prior call's, return tiny ack."""
@@ -347,7 +374,12 @@ def _maybe_dedup(tab_id: Any, tool: str, args: dict[str, Any],
         return response  # unhashable response — pass through, can't dedup
     key = _ledger_key(tab_id, tool, args)
     cid = _new_call_id()
-    if not force_refresh:
+    # Locators are exempt. Their payload is an INDEX into a snapshot, and an
+    # identical response proves nothing about whether that index still points
+    # at the same element — the page may have re-laid-out under it. Handing
+    # back "_unchanged_since" also withholds the very number the caller asked
+    # for, costing a second call to get it.
+    if not force_refresh and tool not in _NEVER_DEDUP:
         prior = _state["call_ledger"].get(key)
         if prior and prior["hash"] == rh:
             return {
@@ -1183,14 +1215,24 @@ async def find_all_by_text(tab_id: str, text: str, role_hint: str | None = None,
 
 @mcp.tool()
 async def aria_type(tab_id: str, idx: int, text: str, clear: bool = True,
+                    submit: bool = False,
                      humanize: bool = True) -> dict[str, Any]:
     """Type into ARIA input by idx. humanize=True (default)=log-normal keystroke +
     pair-classification (~80-150ms/char, defeats cadence detectors). False=instant
     CDP keys (detectable). For multi-field use `fill_form`; for big paste use `paste_text`.
 
-    Ex: aria_type('t0', 1, 'me@example.com') → {"ok":true}"""
+    `submit=True` presses Enter afterwards — how a chip/tag input (an email
+    recipient list, a search box) commits what you just typed. Without it the
+    text sits in the box uncommitted and the next click discards it.
+
+    Ex: aria_type('t0', 1, 'me@example.com') → {"ok":true}
+    Ex: aria_type('t0', 1, 'me@example.com', submit=True) → {"ok":true,"submitted":true}"""
     ok = await _get_aria(tab_id).type(idx, text, clear=clear, jitter=humanize)
-    return _compact({"ok": ok})
+    out: dict[str, Any] = {"ok": ok}
+    if ok and submit:
+        await tab_utils.press_key(_get_tab(tab_id), "Enter")
+        out["submitted"] = True
+    return _compact(out)
 
 
 @mcp.tool()
@@ -1233,13 +1275,40 @@ async def current_state(tab_id: str, force_refresh: bool = False) -> dict[str, A
 # ═════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def click_at(tab_id: str, x: float, y: float, button: str = "left") -> dict[str, Any]:
+async def click_at(tab_id: str, x: float, y: float, button: str = "left",
+                    space: Literal["css", "screenshot"] = "css") -> dict[str, Any]:
     """Pixel click for captcha/canvas/PDF where ARIA misses. Coords from screenshot/
     inspect_element rect. Default to aria_click — pixel is fragile.
 
-    Ex: click_at('t0', 320, 480) → {"ok":true}"""
+    `space="screenshot"` means "these are the coordinates I read off the last
+    screenshot of this tab", and the conversion to page pixels is done here.
+    Two rescalings sit between an image and the page — the capture may not be
+    1:1 with the CSS viewport, and anything wider than 1568px reaches you
+    downscaled again — so eyeballed coordinates land somewhere else on a wide
+    window. This removes that arithmetic; `element_rect(idx)` avoids it
+    entirely and is still the better move when the target has an ARIA node.
+
+    Ex: click_at('t0', 320, 480) → {"ok":true}
+    Ex: click_at('t0', 640, 300, space='screenshot') → {"ok":true,"css":{"x":857,"y":402}}"""
+    out: dict[str, Any] = {"ok": True}
+    if space == "screenshot":
+        shot = _state.get("shots", {}).get(tab_id)
+        if not shot or not shot.get("img_w"):
+            return _compact({"ok": False, "why": "no screenshot taken for this tab "
+                                                 "yet — capture one, or pass CSS "
+                                                 "coordinates"})
+        if shot.get("full_page"):
+            return _compact({"ok": False, "why": "the last capture was full_page, "
+                                                 "whose pixels do not map onto the "
+                                                 "viewport at all — re-shoot with "
+                                                 "full_page=False"})
+        img_w = shot["img_w"]
+        seen_w = min(img_w, _VISION_MAX_PX)      # what you actually looked at
+        factor = (img_w / seen_w) / (shot.get("px_per_css") or 1.0)
+        x, y = round(x * factor, 1), round(y * factor, 1)
+        out["css"] = {"x": x, "y": y}
     await tab_utils.click_at(_get_tab(tab_id), x, y, button=button)
-    return _compact({"ok": True})
+    return _compact(out)
 
 
 @mcp.tool()
@@ -1399,11 +1468,17 @@ async def grep_text(tab_id: str, pattern: str, selector: str = "body",
 
 @mcp.tool()
 async def dom_query(tab_id: str, selector: str, max_results: int = 30,
-                     pierce: bool = True, force_refresh: bool = False) -> dict[str, Any]:
+                     pierce: bool = True, force_refresh: bool = False,
+                     limit: int | None = None) -> dict[str, Any]:
     """querySelectorAll → element list w/ attrs (href/data-*/src/rect). pierce walks
     shadow + iframes. Columnar-compressed.
 
+    `limit` is accepted as an alias for `max_results` — the wrong guess used to
+    fail the whole call on an unknown-keyword error.
+
     Ex: dom_query('t0', 'a.btn', 5) → {"_untrusted":true,"elements":{"_columnar":true,"keys":["tag","href","rect"],...}}"""
+    if limit is not None:
+        max_results = int(limit)
     data = _compact({"_untrusted": True, "elements": await tab_utils.dom_query(_get_tab(tab_id), selector, max_results=max_results, pierce=pierce)})
     return _maybe_dedup(tab_id, "dom_query",
                          {"tab_id": tab_id, "selector": selector,
@@ -1497,9 +1572,64 @@ def _save_shot(b64: str, tag: str) -> dict[str, Any]:
     """
     raw = base64.b64decode(b64)
     _SHOT_DIR.mkdir(parents=True, exist_ok=True)
+    # An unchanged page produces a byte-identical capture. Handing back a new
+    # path invites the caller to spend another image read on a picture it has
+    # already seen — the expensive half of a screenshot is looking at it, not
+    # taking it.
+    digest = hashlib.md5(raw).hexdigest()[:12]
+    prior = _state.setdefault("shot_hashes", {}).get(tag)
+    if prior and prior["hash"] == digest and Path(prior["path"]).exists():
+        return {"path": prior["path"], "fmt": "jpeg", "bytes": len(raw),
+                "b64_len": len(b64), "image": prior.get("image"),
+                "_unchanged": True,
+                "_hint": "byte-identical to the previous capture of this tab — "
+                         "the page has not changed, no need to look at it again"}
     path = _SHOT_DIR / f"{tag}-{uuid.uuid4().hex[:10]}.jpg"
     path.write_bytes(raw)
-    return {"path": str(path), "fmt": "jpeg", "bytes": len(raw), "b64_len": len(b64)}
+    out = {"path": str(path), "fmt": "jpeg", "bytes": len(raw), "b64_len": len(b64)}
+    dims = _jpeg_size(raw)
+    if dims:
+        out["image"] = {"w": dims[0], "h": dims[1]}
+    _state["shot_hashes"][tag] = {"hash": digest, "path": str(path),
+                                  "image": out.get("image")}
+    return out
+
+
+# Vision downscales any image wider than this before the model sees it.
+_VISION_MAX_PX = 1568
+
+
+def _jpeg_size(raw: bytes) -> tuple[int, int] | None:
+    """Pixel dimensions straight from the JPEG SOF marker.
+
+    Callers read click coordinates off the image; without its size they cannot
+    tell whether those pixels are the page's CSS pixels or a scaled capture,
+    and a mismatch sends every click to the wrong place.
+    """
+    i, n = 2, len(raw)
+    while i + 9 < n:
+        if raw[i] != 0xFF:
+            i += 1
+            continue
+        marker = raw[i + 1]
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            return (int.from_bytes(raw[i + 7:i + 9], "big"),
+                    int.from_bytes(raw[i + 5:i + 7], "big"))
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        i += 2 + int.from_bytes(raw[i + 2:i + 4], "big")
+    return None
+
+
+async def _shot_frame(tab_id: str) -> dict[str, Any]:
+    """CSS viewport + device pixel ratio, for mapping image px → click px."""
+    with contextlib.suppress(Exception):
+        raw = await _get_tab(tab_id).evaluate(
+            "JSON.stringify({w: innerWidth, h: innerHeight, dpr: devicePixelRatio})")
+        if isinstance(raw, str):
+            return json.loads(raw)
+    return {}
 
 
 @mcp.tool()
@@ -1523,6 +1653,40 @@ async def screenshot(tab_id: str, full_page: bool = False, quality: int = 65,
     b64 = await tab_utils.screenshot(_get_tab(tab_id), fmt="jpeg", quality=quality,
                                      full_page=full_page)
     out = _save_shot(b64, tab_id)
+    frame = await _shot_frame(tab_id)
+    if frame:
+        out["viewport"] = {"w": frame.get("w"), "h": frame.get("h")}
+        img = out.get("image") or {}
+        if img.get("w") and frame.get("w"):
+            scale = round(img["w"] / frame["w"], 3)
+            out["px_per_css"] = scale
+            hints = []
+            if scale != 1:
+                hints.append(f"image is {scale}x the CSS viewport, so divide "
+                             f"image coordinates by {scale}")
+            # An agent does not see this file at full size: vision downscales
+            # anything wider than ~1568px, and a coordinate read off THAT view
+            # is in a third coordinate space again. This is the mismatch that
+            # sends clicks to the wrong place on a wide window.
+            if img["w"] > _VISION_MAX_PX:
+                shrink = round(img["w"] / _VISION_MAX_PX, 2)
+                hints.append(f"you will see this image downscaled to "
+                             f"{_VISION_MAX_PX}px wide, so multiply coordinates "
+                             f"you read from it by {shrink}")
+            if hints:
+                scale_hint = ("; ".join(hints)
+                              + " — or skip the arithmetic and pass "
+                                "space='screenshot' to click_at, which "
+                                "converts for you")
+                # Keep whatever _save_shot already said (e.g. that this is a
+                # repeat capture) instead of clobbering it.
+                out["_hint"] = (f"{out['_hint']} | {scale_hint}"
+                                if out.get("_hint") else scale_hint)
+    _state.setdefault("shots", {})[tab_id] = {
+        "img_w": (out.get("image") or {}).get("w"),
+        "px_per_css": out.get("px_per_css", 1.0),
+        "full_page": full_page,
+    }
     if include_b64:
         out["b64"] = b64
     return _compact(out, max_str=10**9)  # never truncate an image payload
@@ -1555,11 +1719,31 @@ async def evaluate(tab_id: str, expression: str, await_promise: bool = False,
                     max_chars: int = 5000) -> dict[str, Any]:
     """Run JS in page (last-resort escape hatch). Prefer dom_query/extract_text/aria_*.
 
+    An expression returning an object or array comes back as the plain value.
+    CDP serializes those as `[[key, {type, value}], …]` pairs, which is both
+    unreadable and several times larger than the data — callers were rewriting
+    their JS with an explicit JSON.stringify just to get a usable answer.
+
     Ex: evaluate('t0', 'document.title') → {"_untrusted":true,"result":"Hacker News"}
+    Ex: evaluate('t0', '({a: 1, b: [2,3]})') → {"_untrusted":true,"result":{"a":1,"b":[2,3]}}
     Ex: evaluate('t0', 'fetch("/api/me").then(r=>r.json())', await_promise=True)"""
     tab = _get_tab(tab_id)
     result = await tab.evaluate(expression, await_promise=await_promise)
-    return _compact({"_untrusted": True, "result": result}, max_str=max_chars)
+    # A thrown exception arrives as CDP's full ExceptionDetails: hundreds of
+    # tokens of stack frames and script ids whose `text` is the useless word
+    # "Uncaught", with the actual message buried three levels down. Report the
+    # message and where it happened.
+    described = getattr(getattr(result, "exception", None), "description", None)
+    if described or getattr(result, "exception_id", None) is not None:
+        line = getattr(result, "line_number", None)
+        col = getattr(result, "column_number", None)
+        msg = described or getattr(result, "text", "") or "threw"
+        where = f" (at {line}:{col})" if line is not None else ""
+        return _compact({"_untrusted": True, "ok": False,
+                         "error": str(msg).split("\n")[0] + where},
+                        max_str=max_chars)
+    return _compact({"_untrusted": True, "result": _unwrap_cdp(result)},
+                    max_str=max_chars)
 
 
 @mcp.tool()
