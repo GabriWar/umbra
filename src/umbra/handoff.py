@@ -31,6 +31,7 @@ import shutil
 import socket
 import subprocess
 from contextlib import suppress
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import websockets
@@ -95,10 +96,34 @@ ws.onmessage = e => {
     const m = JSON.parse(e.data);
     if (m.type === 'frame') {
         img.src = 'data:image/jpeg;base64,' + m.b64;
+        status.textContent = m.url || 'connected';
+        status.className = 'ok';
+    } else if (m.type === 'paused') {
+        status.textContent = m.text;
+        status.className = 'dead';
     } else if (m.type === 'reason') {
         document.getElementById('reason').textContent = m.text;
+    } else if (m.type === 'view_only') {
+        // Watch mode: input reaches the browser only after TAKE CONTROL.
+        watchMode = true;
+        document.getElementById('done').textContent = 'TAKE CONTROL';
+        setControl(false);
+    } else if (m.type === 'control') {
+        setControl(m.active);
     }
 };
+let viewOnly = false, watchMode = false, inControl = false;
+function setControl(active) {
+    inControl = active;
+    viewOnly = !active;
+    document.getElementById('done').textContent = active ? 'GIVE BACK TO AGENT' : 'TAKE CONTROL';
+    document.getElementById('kbd-hint').textContent = active
+        ? 'agent paused - you are driving' : 'read-only live view';
+    img.style.cursor = active ? 'crosshair' : 'default';
+}
+
+const rawSend = ws.send.bind(ws);
+ws.send = data => { if (!viewOnly) rawSend(data); };
 
 function imgCoords(e) {
     const r = img.getBoundingClientRect();
@@ -145,6 +170,10 @@ viewport.addEventListener('wheel', e => {
 }, { passive: false });
 
 document.getElementById('done').onclick = async () => {
+    if (watchMode) {
+        rawSend(JSON.stringify({type: inControl ? 'give' : 'take'}));
+        return;
+    }
     if (ws.readyState === 1) ws.send(JSON.stringify({type: 'done'}));
     // HTTP fallback: WS may be dead or its reader stuck; this always lands.
     try {
@@ -262,8 +291,21 @@ class HandoffSession:
     """One handoff session: live remote view of a tab via WS+HTTP on the same port."""
 
     def __init__(self, tab: Any, reason: str = "user input needed", fps: int = 3,
-                 tunnel: bool = False):
+                 tunnel: bool = False, *, view_only: bool = False,
+                 get_tab: Callable[[], Any] | None = None,
+                 paused: Callable[[Any], Awaitable[str | None]] | None = None,
+                 on_control: Callable[[bool], None] | None = None):
+        """view_only: stream frames, ignore input (watch mode) until the viewer
+        takes control; on_control(True/False) is told when they take/give back.
+        get_tab: called per frame to pick the tab to show (follow mode).
+        paused: per frame; a non-empty answer replaces the frame with that text."""
         self.tab = tab
+        self.view_only = view_only
+        self.control = False
+        self._get_tab = get_tab or (lambda: self.tab)
+        self._paused = paused
+        self._on_control = on_control
+        self._clients: set[Any] = set()
         self.reason = reason
         self.fps = fps
         self.tunnel = tunnel
@@ -316,7 +358,7 @@ class HandoffSession:
                     ]),
                     body=body,
                 )
-            if req_path.rstrip("/").endswith("/done"):
+            if req_path.rstrip("/").endswith("/done") and not self.view_only:
                 from websockets.http11 import Response
                 from websockets.datastructures import Headers
                 self.done_event.set()
@@ -388,6 +430,8 @@ class HandoffSession:
             return False
 
     async def stop(self) -> None:
+        if self.control:
+            await self.set_control(False)  # never leave the agent paused
         if self._screenshot_task:
             self._screenshot_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -404,19 +448,32 @@ class HandoffSession:
         """One client connected. Start screenshot loop, handle inputs."""
         with suppress(Exception):
             await websocket.send(json.dumps({"type": "reason", "text": self.reason}))
+            if self.view_only:
+                await websocket.send(json.dumps({"type": "view_only"}))
 
         # Local ref: on page refresh the new connection may start before this
         # one's finally runs — cancelling self._screenshot_task would kill the
         # NEW loop.
         task = asyncio.create_task(self._screenshot_loop(websocket))
         self._screenshot_task = task
+        self._clients.add(websocket)
+        if self.control:
+            with suppress(Exception):
+                await websocket.send(json.dumps({"type": "control", "active": True}))
         try:
             async for msg in websocket:
                 try:
                     data = json.loads(msg)
                 except (json.JSONDecodeError, TypeError):
                     continue
-                if data.get("type") == "done":
+                if self.view_only:
+                    kind = data.get("type")
+                    if kind in ("take", "give"):
+                        await self.set_control(kind == "take")
+                        continue
+                    if not self.control:
+                        continue
+                elif data.get("type") == "done":
                     self.done_event.set()
                     return
                 with suppress(Exception):
@@ -424,7 +481,19 @@ class HandoffSession:
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
+            self._clients.discard(websocket)
             task.cancel()
+
+    async def set_control(self, active: bool) -> None:
+        """Watch mode: hand the browser to the viewer, or back to the agent."""
+        if active == self.control:
+            return
+        self.control = active
+        if self._on_control:
+            self._on_control(active)
+        for ws in list(self._clients):
+            with suppress(Exception):
+                await ws.send(json.dumps({"type": "control", "active": active}))
 
     async def _screenshot_loop(self, websocket: Any) -> None:
         """Stream JPEG screenshots over the websocket at `self.fps` Hz."""
@@ -433,13 +502,21 @@ class HandoffSession:
         interval = 1.0 / max(self.fps, 1)
         while not self.done_event.is_set():
             try:
+                tab = self._get_tab()
+                why = "waiting for the agent to open a tab" if tab is None else (
+                    await self._paused(tab) if self._paused else None)
+                if why:
+                    await websocket.send(json.dumps({"type": "paused", "text": why}))
+                    await asyncio.sleep(interval)
+                    continue
                 shot = await asyncio.wait_for(
-                    self.tab.send(cdp.page.capture_screenshot(format_="jpeg", quality=45)),
+                    tab.send(cdp.page.capture_screenshot(format_="jpeg", quality=45)),
                     _CDP_TIMEOUT_S,
                 )
                 if isinstance(shot, bytes):
                     shot = base64.b64encode(shot).decode("ascii")
-                await websocket.send(json.dumps({"type": "frame", "b64": shot}))
+                url = str(getattr(getattr(tab, "target", None), "url", "") or "")
+                await websocket.send(json.dumps({"type": "frame", "b64": shot, "url": url}))
             except websockets.exceptions.ConnectionClosed:
                 return
             except Exception as e:  # noqa: BLE001
@@ -450,29 +527,32 @@ class HandoffSession:
         """Translate a user input event to a CDP Input.* call."""
         import nodriver as uc
         cdp = uc.cdp
+        tab = self._get_tab()
+        if tab is None:
+            return
         t = data.get("type")
         x, y = float(data.get("x", 0)), float(data.get("y", 0))
 
         if t == "mousemove":
-            await self.tab.send(cdp.input_.dispatch_mouse_event(
+            await tab.send(cdp.input_.dispatch_mouse_event(
                 type_="mouseMoved", x=x, y=y,
             ))
         elif t == "click":
             btn_str = data.get("button", "left")
             btn = cdp.input_.MouseButton(btn_str)
-            await self.tab.send(cdp.input_.dispatch_mouse_event(
+            await tab.send(cdp.input_.dispatch_mouse_event(
                 type_="mousePressed", x=x, y=y, button=btn, click_count=1,
             ))
-            await self.tab.send(cdp.input_.dispatch_mouse_event(
+            await tab.send(cdp.input_.dispatch_mouse_event(
                 type_="mouseReleased", x=x, y=y, button=btn, click_count=1,
             ))
         elif t == "dblclick":
             btn = cdp.input_.MouseButton("left")
             for _ in range(2):
-                await self.tab.send(cdp.input_.dispatch_mouse_event(
+                await tab.send(cdp.input_.dispatch_mouse_event(
                     type_="mousePressed", x=x, y=y, button=btn, click_count=2,
                 ))
-                await self.tab.send(cdp.input_.dispatch_mouse_event(
+                await tab.send(cdp.input_.dispatch_mouse_event(
                     type_="mouseReleased", x=x, y=y, button=btn, click_count=2,
                 ))
         elif t == "key":
@@ -481,17 +561,17 @@ class HandoffSession:
             vk, text = SPECIAL_KEYS.get(key, (0, data.get("text", "")))
             mods = (1 if data.get("alt") else 0) | (2 if data.get("ctrl") else 0) \
                 | (4 if data.get("meta") else 0) | (8 if data.get("shift") else 0)
-            await self.tab.send(cdp.input_.dispatch_key_event(
+            await tab.send(cdp.input_.dispatch_key_event(
                 type_="keyDown" if text else "rawKeyDown", key=key, code=code,
                 text=text or None, unmodified_text=text or None, modifiers=mods,
                 windows_virtual_key_code=vk or None,
             ))
-            await self.tab.send(cdp.input_.dispatch_key_event(
+            await tab.send(cdp.input_.dispatch_key_event(
                 type_="keyUp", key=key, code=code, modifiers=mods,
                 windows_virtual_key_code=vk or None,
             ))
         elif t == "scroll":
-            await self.tab.send(cdp.input_.dispatch_mouse_event(
+            await tab.send(cdp.input_.dispatch_mouse_event(
                 type_="mouseWheel", x=x, y=y,
                 delta_x=float(data.get("dx", 0)), delta_y=float(data.get("dy", 0)),
             ))

@@ -19,6 +19,7 @@
                      har_replay_load  (HAR-1.2 record + replay)
   Stealth            check_detection / warm_session / rotate_fingerprint
   Handoff            handoff_start / handoff_wait / request_user_input  (live remote view → user solves → resume)
+  Watch              watch_start / watch_stop  (read-only live view, agent keeps working)
   TLS                tls_fetch  (raw HTTP w/ Chrome JA3, skip browser entirely)
   Search             web_search  (built-in meta-search: dorks × ddg/bing/brave/google → ranked)
   Session            session_save / session_load / session_list / session_delete
@@ -215,6 +216,9 @@ async def _lifespan(_server: Any) -> Any:
     finally:
         if srv is not None:
             await vault_unlock.stop(srv)
+        watch = _state.pop("watch", None)
+        if watch is not None:
+            await watch.stop()  # also ends its cloudflared tunnel
 
 
 mcp = FastMCP("umbra", instructions=_SERVER_INSTRUCTIONS, lifespan=_lifespan)
@@ -2426,6 +2430,96 @@ async def request_user_input(tab_id: str, reason: str = "user input needed",
 
 
 # ═════════════════════════════════════════════════════════════════════════
+# Watch — read-only live view for the human, agent keeps working
+# ═════════════════════════════════════════════════════════════════════════
+
+# Watch-page TAKE CONTROL: while active, tab-scoped agent calls wait.
+_HUMAN_WAIT_S = 600.0
+_human = {"active": False, "released": asyncio.Event(), "touched": False}
+_human["released"].set()
+
+
+def _on_human_control(active: bool) -> None:
+    _human["active"] = active
+    if active:
+        _human["released"].clear()
+    else:
+        _human["touched"] = True
+        _human["released"].set()
+
+
+async def _wait_for_human(args: dict[str, Any]) -> None:
+    """Hold a tab-scoped call while the human drives the browser."""
+    if not _human["active"] or "tab_id" not in args:
+        return
+    try:
+        await asyncio.wait_for(_human["released"].wait(), _HUMAN_WAIT_S)
+    except asyncio.TimeoutError:
+        raise ToolError("the user has taken control of the browser from the watch page "
+                        "and has not given it back yet; try again later") from None
+
+
+def _followed_tab() -> Any:
+    """The tab the agent used last (watch follow mode)."""
+    if not _state["tabs"]:
+        return None
+    return max(_state["tabs"].values(), key=lambda e: e.get("last_used_at", 0))["tab"]
+
+
+async def _watch_paused(tab: Any) -> str | None:
+    """No frames while a filled password is on a page of this tab's browser:
+    the agent knows the watch URL too."""
+    if not vault_guard.hot:
+        return None
+    for e in _state["tabs"].values():
+        if e["tab"] is tab:
+            if await _hot_tabs_in(e["browser_id"]):
+                return "paused: a stored password is on screen"
+            return None
+    return None
+
+
+@mcp.tool()
+async def watch_start(tab_id: str | None = None, tunnel: bool = True,
+                      fps: int = 3) -> dict[str, Any]:
+    """Live view so the human can watch what you do (e.g. umbra on a VPS).
+    Unlike handoff it never blocks: you keep working. The page has a TAKE
+    CONTROL button: while the user drives, your tab calls wait (up to 10 min)
+    and the first result after they give it back carries `_user_interacted` —
+    re-check the page then. tab_id=None follows whichever tab you used last.
+    One watch per server; calling again returns the same URL. Frames pause
+    while a fill_secret password is on screen. Stop with watch_stop.
+
+    Ex: watch_start() → {"url":"https://abc.trycloudflare.com/h-XYZ/","following":"last used tab"}"""
+    from umbra.handoff import HandoffSession
+    existing = _state.get("watch")
+    if existing is not None:
+        return _compact({"url": existing.url, "already_running": True})
+    session = HandoffSession(
+        _get_tab(tab_id) if tab_id else None, reason="watching umbra",
+        fps=fps, tunnel=tunnel, view_only=True,
+        get_tab=None if tab_id else _followed_tab, paused=_watch_paused,
+        on_control=_on_human_control)
+    url = await session.start()
+    _state["watch"] = session
+    return _compact({"url": url, "following": tab_id or "last used tab",
+                     "tunnel": "active" if "trycloudflare" in url else "off",
+                     "next": "give the URL to the user; call watch_stop when done"})
+
+
+@mcp.tool()
+async def watch_stop() -> dict[str, Any]:
+    """Stop the watch_start live view (and its tunnel).
+
+    Ex: watch_stop() → {"stopped":true}"""
+    session = _state.pop("watch", None)
+    if session is None:
+        return {"stopped": False, "why": "no watch running"}
+    await session.stop()
+    return {"stopped": True}
+
+
+# ═════════════════════════════════════════════════════════════════════════
 # TLS-pinned raw fetch (skip DOM entirely for JSON APIs)
 # ═════════════════════════════════════════════════════════════════════════
 
@@ -2589,11 +2683,25 @@ async def _stale_pages(browser_id: str) -> list[str]:
     return stale
 
 
+def _note_user_interacted(result: Any) -> None:
+    """Tell the agent the user drove the browser since its last call."""
+    note = "the user took control from the watch page and interacted; re-check the page"
+    if isinstance(result.structured_content, dict):
+        result.structured_content["_user_interacted"] = note
+    for block in result.content or []:
+        text = getattr(block, "text", None)
+        if isinstance(text, str) and text.startswith("{"):
+            with contextlib.suppress(ValueError):
+                block.text = json.dumps({**json.loads(text), "_user_interacted": note})
+            break
+
+
 class _VaultMiddleware(Middleware):
     """Gate before every MCP/REST tool call; redact results and errors after."""
 
     async def on_call_tool(self, context: Any, call_next: Any) -> Any:
         msg = context.message
+        await _wait_for_human(msg.arguments or {})
         await _vault_gate(msg.name, msg.arguments or {})
         try:
             result = await call_next(context)
@@ -2607,6 +2715,9 @@ class _VaultMiddleware(Middleware):
                 block.text = vault_guard.redact_text(block.text)
         if result.structured_content is not None:
             result.structured_content = vault_guard.redact(result.structured_content)
+        if _human["touched"] and "tab_id" in (msg.arguments or {}):
+            _human["touched"] = False
+            _note_user_interacted(result)
         return result
 
 
@@ -2828,7 +2939,8 @@ async def batch(
                 break
             continue
         try:
-            # Inner calls skip the MCP middleware, so the vault gate runs here.
+            # Inner calls skip the MCP middleware, so these gates run here.
+            await _wait_for_human(args)
             await _vault_gate(tool_name, args)
             data = await tool_obj.fn(**args)
             elapsed_ms = int((_t.perf_counter() - call_t0) * 1000)
