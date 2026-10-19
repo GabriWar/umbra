@@ -36,20 +36,13 @@ from typing import Any
 import websockets
 from websockets.asyncio.server import serve as ws_serve
 
+from umbra.driver.utils import SPECIAL_KEYS
+
 log = logging.getLogger("umbra.handoff")
 
 # A CDP call can hang forever when the tab swaps renderer process (cross-site
 # navigation) — the pending command never gets a reply. Bound every call.
 _CDP_TIMEOUT_S = 2.0
-
-# Non-printable keys need windowsVirtualKeyCode or Chrome ignores them
-# (Backspace doesn't delete, Enter doesn't submit). Enter/Tab also carry text.
-_SPECIAL_KEYS: dict[str, tuple[int, str]] = {
-    "Backspace": (8, ""), "Tab": (9, "\t"), "Enter": (13, "\r"),
-    "Escape": (27, ""), "Delete": (46, ""), "Home": (36, ""), "End": (35, ""),
-    "PageUp": (33, ""), "PageDown": (34, ""), "ArrowLeft": (37, ""),
-    "ArrowUp": (38, ""), "ArrowRight": (39, ""), "ArrowDown": (40, ""),
-}
 
 
 # Index HTML built once. Sets up canvas-style remote view + input forwarding.
@@ -485,7 +478,7 @@ class HandoffSession:
         elif t == "key":
             key = data.get("key", "")
             code = data.get("code", "")
-            vk, text = _SPECIAL_KEYS.get(key, (0, data.get("text", "")))
+            vk, text = SPECIAL_KEYS.get(key, (0, data.get("text", "")))
             mods = (1 if data.get("alt") else 0) | (2 if data.get("ctrl") else 0) \
                 | (4 if data.get("meta") else 0) | (8 if data.get("shift") else 0)
             await self.tab.send(cdp.input_.dispatch_key_event(

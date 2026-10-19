@@ -59,6 +59,16 @@ async def reload(tab: Any, *, hard: bool = False) -> None:
 
 # ─────────────────────────────── input ────────────────────────────────
 
+# Non-printable keys need windowsVirtualKeyCode or Chrome ignores them
+# (Backspace doesn't delete, Enter doesn't submit). Enter/Tab also carry text.
+SPECIAL_KEYS: dict[str, tuple[int, str]] = {
+    "Backspace": (8, ""), "Tab": (9, "\t"), "Enter": (13, "\r"),
+    "Escape": (27, ""), "Delete": (46, ""), "Home": (36, ""), "End": (35, ""),
+    "PageUp": (33, ""), "PageDown": (34, ""), "ArrowLeft": (37, ""),
+    "ArrowUp": (38, ""), "ArrowRight": (39, ""), "ArrowDown": (40, ""),
+}
+
+
 async def press_key(tab: Any, key: str, *, modifiers: list[str] | None = None) -> None:
     """Press a single key (Enter, Escape, Tab, etc) without coord math.
 
@@ -68,13 +78,15 @@ async def press_key(tab: Any, key: str, *, modifiers: list[str] | None = None) -
     if modifiers:
         for m in modifiers:
             mod_mask |= {"alt": 1, "ctrl": 2, "meta": 4, "shift": 8}.get(m.lower(), 0)
-    text = key if len(key) == 1 else ""
+    vk, text = SPECIAL_KEYS.get(key, (0, key if len(key) == 1 else ""))
     await tab.send(cdp.input_.dispatch_key_event(
-        type_="keyDown", key=key, code=key, text=text,
-        unmodified_text=text, modifiers=mod_mask,
+        type_="keyDown" if text else "rawKeyDown", key=key, code=key,
+        text=text or None, unmodified_text=text or None, modifiers=mod_mask,
+        windows_virtual_key_code=vk or None,
     ))
     await tab.send(cdp.input_.dispatch_key_event(
         type_="keyUp", key=key, code=key, modifiers=mod_mask,
+        windows_virtual_key_code=vk or None,
     ))
 
 
