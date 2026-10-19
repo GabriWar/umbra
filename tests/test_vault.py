@@ -160,6 +160,22 @@ def test_rbw_backend_with_fake_binary(tmp_path, monkeypatch):
     assert e.password == "bw-pass-1" and e.origins == ["https://github.com"]
 
 
+@pytest.mark.parametrize("name", ["bw:--clipboard::GitHub", "bw:GitHub::--field",
+                                  "kr:--help", "-x"])
+def test_flag_like_names_rejected(name):
+    with pytest.raises(store.VaultError, match="may not start"):
+        store.resolve(name)
+
+
+def test_rbw_gets_end_of_options_marker(monkeypatch):
+    seen = []
+    monkeypatch.setattr(store, "_run", lambda cmd, **_k: seen.append(cmd) or
+                        SimpleNamespace(returncode=1, stdout="", stderr="nope"))
+    with pytest.raises(store.VaultError):
+        store.bw_get("GitHub")
+    assert seen[0][:4] == ["rbw", "get", "--raw", "--"]
+
+
 # ───────────────────────────── redaction ─────────────────────────────
 
 def test_redaction_variants_and_nesting():

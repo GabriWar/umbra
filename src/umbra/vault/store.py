@@ -222,7 +222,7 @@ def keyring_put(entry: Entry) -> None:
 
 
 def keyring_get(name: str) -> Entry:
-    r = _run(["secret-tool", "lookup", "app", _KEYRING_APP, "name", name])
+    r = _run(["secret-tool", "lookup", "--", "app", _KEYRING_APP, "name", name])
     if r.returncode != 0 or not r.stdout:
         raise VaultError(f"no keyring entry named {name!r}")
     return Entry(name="kr:" + name, **json.loads(r.stdout))
@@ -280,7 +280,8 @@ def bw_names() -> list[str]:
 def bw_get(ref: str) -> Entry:
     name, _, user = ref.partition("::")
     # A locked rbw pops pinentry here: that prompt goes to the human, not us.
-    r = _run(["rbw", "get", "--raw", name, *([user] if user else [])])
+    # `--`: a name like "--clipboard" would otherwise copy the password out.
+    r = _run(["rbw", "get", "--raw", "--", name, *([user] if user else [])])
     if r.returncode != 0:
         raise VaultError(f"rbw get failed for {name!r}: {r.stderr.strip()[:200]}")
     return _bw_entry("bw:" + ref, json.loads(r.stdout))
@@ -308,6 +309,9 @@ def parse_bitwarden_export(text: str) -> list[Entry]:
 # ─────────────────────────────── resolve ───────────────────────────────
 
 def resolve(name: str) -> Entry:
+    # Names reach argv of rbw / secret-tool; nothing that parses as a flag.
+    if any(part.startswith("-") for part in name.removeprefix("bw:").removeprefix("kr:").split("::")):
+        raise VaultError("entry names may not start with '-'")
     if name.startswith("bw:"):
         if not rbw_available():
             raise VaultError("rbw not installed (`sudo pacman -S rbw`, then `rbw login`)")
