@@ -56,7 +56,7 @@ def route_is_safe(rule: Any) -> bool:
 # (a text/selector match can be asked one character at a time).
 ALLOWED_WHILE_HOT = frozenset({
     "fill_secret", "secrets_list",
-    "aria_click", "click_at", "press_key", "hover", "scroll", "element_rect",
+    "aria_click", "click_at", "press_key", "hover", "scroll",
     "wait_for", "navigate", "back", "forward", "reload", "close",
     "switch_tab", "list_tabs",
 })
@@ -65,7 +65,8 @@ ALLOWED_WHILE_HOT = frozenset({
 def allowed_while_hot(tool: str, args: dict[str, Any]) -> bool:
     if tool not in ALLOWED_WHILE_HOT or is_injecting(tool, args):
         return False
-    return not (tool == "wait_for" and args.get("selector"))
+    # Any selector/text argument turns a harmless action into a DOM query.
+    return not (args.get("selector") or args.get("text"))
 
 
 # Schemes that only ever load a new document. Anything else (javascript:,

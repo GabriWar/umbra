@@ -283,8 +283,12 @@ async def test_gate_blocks_readers_while_secret_in_page(fake_tabs, monkeypatch):
                 "blob:https://a.com/x", "chrome://settings"):
         with pytest.raises(ToolError):
             await server._vault_gate("navigate", {"tab_id": "t0", "url": url})
-    with pytest.raises(ToolError):
-        await server._vault_gate("wait_for", {"tab_id": "t0", "selector": "input[value^=a]"})
+    for tool, extra in (("wait_for", {"selector": "input[value^=a]"}),
+                        ("scroll", {"selector": "input[value^=a]"}),
+                        ("element_rect", {"idx": 3})):
+        with pytest.raises(ToolError):
+            await server._vault_gate(tool, {"tab_id": "t0", **extra})
+    await server._vault_gate("scroll", {"tab_id": "t0", "dy": 300})
     await server._vault_gate("wait_for", {"tab_id": "t0", "url_contains": "/done"})
     await server._vault_gate("aria_click", {"tab_id": "t0", "idx": 3})
     await server._vault_gate("navigate", {"tab_id": "t0", "url": "https://a.com"})

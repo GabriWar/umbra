@@ -2554,7 +2554,7 @@ async def _vault_gate(tool: str, args: dict[str, Any]) -> None:
                 f"refused: {', '.join(holding)} holds a secret filled by fill_secret. "
                 "While that page is current, only these tools work in this browser: "
                 + ", ".join(sorted(vault_guard.ALLOWED_WHILE_HOT))
-                + " (wait_for without selector). Submit the form, then navigate or "
+                + " (none with a selector/text argument). Submit the form, then navigate or "
                 "reload to continue.")
     if injecting:
         # Stamped before the call: the code may start running before it returns.
