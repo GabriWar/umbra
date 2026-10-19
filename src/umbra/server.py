@@ -2667,9 +2667,6 @@ async def fill_secret(tab_id: str, name: str,
         return refuse(str(e))
     if not vault_store.origin_allowed(origin, entry.origins):
         return refuse(f"{origin} is not an allowed origin for {name!r}", allowed=entry.origins)
-    stale = await _stale_pages(bid)
-    if stale:
-        return refuse("agent code may still be running in this browser", pages=stale)
 
     want = list(fields) if fields else [f for f in ("username", "password") if getattr(entry, f)]
     values: dict[str, str] = {}
@@ -2687,24 +2684,43 @@ async def fill_secret(tab_id: str, name: str,
         ok, why = await vault_guard.confirm(name, origin)
         if not ok:
             return refuse(why)
+        # The human may have taken a while: look at the page again.
+        try:
+            st = await vault_fill.page_state(tab)
+        except Exception:  # noqa: BLE001
+            return refuse("could not read the page origin")
+        if st["origin"] != origin:
+            return refuse("page changed origin while waiting for confirmation")
 
-    # Registered before the fill: if it half-succeeds the value is already guarded.
+    # Lock first, then check for agent code: a concurrent evaluate either
+    # stamped dirty_epoch already (caught by _stale_pages) or now hits the
+    # lock. Nothing between here and the fill lets an unchecked call in.
     vault_guard.register(entry.password, name)
     secret_vals = [values[f] for f in ("password", "totp") if f in values]
     record = {"values": secret_vals, "t": st["t"]}
     if secret_vals:
         vault_guard.hot.setdefault(tab_id, []).append(record)
+
+    def unlock_record() -> None:
+        if secret_vals and record in vault_guard.hot.get(tab_id, []):
+            vault_guard.hot[tab_id].remove(record)
+            if not vault_guard.hot[tab_id]:
+                vault_guard.hot.pop(tab_id)
+
+    stale = await _stale_pages(bid)
+    if stale:
+        unlock_record()
+        return refuse("agent code may still be running in this browser", pages=stale)
     try:
         res = await vault_fill.fill(
             tab, origin=origin, fields=want, values=values, submit=submit,
             selectors={"username": username_selector, "password": password_selector,
                        "totp": totp_selector})
     except Exception:  # noqa: BLE001
+        # Fail closed: the value may be in the page, keep the lock.
         return refuse("fill failed inside the page")
-    if secret_vals and not set(res.get("filled", [])) & {"password", "totp"}:
-        vault_guard.hot[tab_id].remove(record)
-        if not vault_guard.hot[tab_id]:
-            vault_guard.hot.pop(tab_id)
+    if not set(res.get("filled", [])) & {"password", "totp"}:
+        unlock_record()
     vault_guard.audit(entry=name, tab=tab_id, origin=origin,
                       result="filled" if res.get("ok") else "partial",
                       filled=res.get("filled"), submitted=res.get("submitted"))

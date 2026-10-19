@@ -363,3 +363,22 @@ async def test_fill_secret_refuses_wrong_origin(fake_tabs, monkeypatch):
     log_line = guard.audit_path().read_text()
     assert "refused" in log_line and "s3cret-pw" not in log_line
     assert not guard.hot
+
+
+async def test_fill_locks_before_checking_for_agent_code(fake_tabs, monkeypatch):
+    store.LocalVault.open("pp-long-enough", create=True).put(
+        store.Entry(name="site", origins=["https://a.com"], password="s3cret-pw"))
+    store.unlock("pp-long-enough", minutes=5)
+
+    async def state(_tab):
+        return {"origin": "https://a.com", "t": 5.0}
+    seen = {}
+
+    async def stale(_bid):
+        seen["locked_during_check"] = "t0" in guard.hot
+        return ["t1 (evaluate ran)"]
+    monkeypatch.setattr(server.vault_fill, "page_state", state)
+    monkeypatch.setattr(server, "_stale_pages", stale)
+    out = await (await server.mcp.get_tool("fill_secret")).fn("t0", "site")
+    assert out["ok"] is False and seen["locked_during_check"] is True
+    assert "t0" not in guard.hot  # refused fill releases its own lock
