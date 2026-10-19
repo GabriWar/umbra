@@ -2973,7 +2973,7 @@ async def batch(
 # Stale-process cleanup
 # ═════════════════════════════════════════════════════════════════════════
 
-_UC_PROFILE_GLOB = "/tmp/uc_*"
+_UC_PREFIX = "/tmp/uc_"
 
 
 async def _close_tab_internal(tab_id: str) -> bool:
@@ -3020,17 +3020,26 @@ async def cleanup_stale_internal(idle_seconds: float) -> dict[str, Any]:
             "idle_seconds": idle_seconds}
 
 
-def _kill_orphan_chromes() -> dict[str, Any]:
-    """Kill leftover Chrome procs from prior umbra-server runs + rmtree their profile dirs.
+# A profile dir this young may belong to a browser another server is still
+# launching (dir created, Chrome not up yet).
+_UC_DIR_GRACE_S = 120.0
 
-    Identifies by `--user-data-dir=/tmp/uc_*` flag in the cmdline. Only touches
-    chromes whose parent isn't this process (so we don't murder our own browsers).
+
+def _kill_orphan_chromes(*, include_self: bool = False) -> dict[str, Any]:
+    """Kill leftover Chrome procs from dead umbra-server runs + rmtree their profile dirs.
+
+    Identifies by `--user-data-dir=/tmp/uc_*` in the cmdline. A Chrome is an
+    orphan only when no ancestor of it is a live umbra server: several servers
+    share a host (one per Claude Code session) and must not kill each other's
+    browsers. include_self=True counts this server's own leftovers as orphans
+    (shutdown, after closing its browsers).
     """
+    from umbra.vault.unlock import is_umbra_server
+
     killed_pids: list[int] = []
     removed_dirs: list[str] = []
     my_pid = os.getpid()
 
-    # 1. find chrome procs with uc-style profile dirs
     try:
         ps = subprocess.run(
             ["ps", "-eo", "pid=,ppid=,cmd="],
@@ -3039,7 +3048,8 @@ def _kill_orphan_chromes() -> dict[str, Any]:
     except Exception:
         ps = None
 
-    in_use_dirs: set[str] = set()
+    parent: dict[int, int] = {}
+    chromes: list[tuple[int, str]] = []
     if ps and ps.returncode == 0:
         for line in ps.stdout.splitlines():
             parts = line.strip().split(None, 2)
@@ -3049,39 +3059,54 @@ def _kill_orphan_chromes() -> dict[str, Any]:
                 pid, ppid = int(parts[0]), int(parts[1])
             except ValueError:
                 continue
-            cmd = parts[2]
-            if "--user-data-dir=/tmp/uc_" not in cmd:
-                continue
-            # Extract the dir
-            for tok in cmd.split():
-                if tok.startswith("--user-data-dir=/tmp/uc_"):
-                    udir = tok.split("=", 1)[1]
-                    if ppid == my_pid:
-                        # Owned by us — don't kill, but remember it's in use
-                        in_use_dirs.add(udir)
-                    else:
-                        try:
-                            os.kill(pid, signal.SIGTERM)
-                            killed_pids.append(pid)
-                        except ProcessLookupError:
-                            pass
-                        except PermissionError:
-                            pass
+            parent[pid] = ppid
+            for tok in parts[2].split():
+                if tok.startswith(f"--user-data-dir={_UC_PREFIX}"):
+                    chromes.append((pid, tok.split("=", 1)[1]))
                     break
+
+    server_cache: dict[int, bool] = {}
+
+    def owned_by_live_server(pid: int) -> bool:
+        seen = set()
+        cur = parent.get(pid, 0)
+        while cur > 1 and cur not in seen:
+            seen.add(cur)
+            if cur == my_pid:
+                if not include_self:
+                    return True
+            else:
+                if cur not in server_cache:
+                    server_cache[cur] = is_umbra_server(cur)
+                if server_cache[cur]:
+                    return True
+            cur = parent.get(cur, 0)
+        return False
+
+    in_use_dirs: set[str] = set()
+    for pid, udir in chromes:
+        if owned_by_live_server(pid):
+            in_use_dirs.add(udir)
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed_pids.append(pid)
+        except (ProcessLookupError, PermissionError):
+            pass
 
     # Give SIGTERM a moment to land before sweeping dirs
     if killed_pids:
         time.sleep(0.5)
 
-    # 2. rmtree any uc_* profile dirs not currently in use by a live chrome
-    for udir in glob.glob(_UC_PROFILE_GLOB):
+    now = time.time()
+    for udir in glob.glob(_UC_PREFIX + "*"):
         if udir in in_use_dirs:
             continue
-        try:
+        with contextlib.suppress(OSError):
+            if now - os.path.getmtime(udir) < _UC_DIR_GRACE_S:
+                continue
             shutil.rmtree(udir, ignore_errors=True)
             removed_dirs.append(udir)
-        except Exception:  # noqa: BLE001
-            pass
 
     return {"killed_pids": killed_pids, "removed_dirs": removed_dirs}
 
@@ -3386,9 +3411,9 @@ async def _shutdown_cleanup() -> None:
             await _close_browser_internal(bid)
         except Exception as e:  # noqa: BLE001
             log.warning("error closing %s: %s", bid, e)
-    # Sweep any leftover uc_* dirs we owned
+    # Our own leftovers only: other servers' browsers stay alive.
     try:
-        _kill_orphan_chromes()
+        _kill_orphan_chromes(include_self=True)
     except Exception as e:  # noqa: BLE001
         log.warning("orphan sweep error: %s", e)
 
@@ -3455,8 +3480,8 @@ def main() -> None:
         handler.addFilter(vault_guard.RedactingFilter())
     log = logging.getLogger("umbra.server")
 
-    # Startup: kill orphan chromes from prior runs (always safe — only kills
-    # chromes whose parent isn't us, and only those using uc_* profile dirs)
+    # Startup: kill orphan chromes left by dead servers (never those of a live
+    # umbra server, so parallel sessions keep their browsers)
     if not args.no_orphan_sweep:
         try:
             res = _kill_orphan_chromes()

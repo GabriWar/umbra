@@ -483,6 +483,10 @@ class HandoffSession:
         finally:
             self._clients.discard(websocket)
             task.cancel()
+            # Viewer gone while driving: don't leave the agent paused.
+            if self.control and not self._clients:
+                with suppress(Exception):
+                    await self.set_control(False)
 
     async def set_control(self, active: bool) -> None:
         """Watch mode: hand the browser to the viewer, or back to the agent."""

@@ -112,6 +112,17 @@ async def test_watch_follows_agent_and_ignores_input(site):
                 server.vault_fill.holds = orig
                 guard.hot.clear()
             await next_msg(ws, "frame")                    # resumes
+        # Viewer leaves while driving: the agent is released, not left waiting.
+        async with websockets.connect(url.replace("http", "ws").rstrip("/") + "/ws",
+                                      max_size=None) as ws2:
+            await ws2.send(json.dumps({"type": "take"}))
+            assert (await next_msg(ws2, "control"))["active"] is True
+        for _ in range(20):
+            if not server._human["active"]:
+                break
+            await asyncio.sleep(0.1)
+        assert server._human["active"] is False
+        await asyncio.wait_for(call("current_state", tab_id=b, force_refresh=True), 5)
     finally:
         assert (await call("watch_stop"))["stopped"] is True
         await call("close_browser", browser_id="watch-e2e")
