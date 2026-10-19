@@ -2514,25 +2514,26 @@ async def _hot_tabs_in(browser_id: str) -> list[str]:
     counts as holding it until its document is replaced AND no input carries
     the value any more. Unreadable pages count as holding it (fail closed)."""
     holding: list[str] = []
-    for tid, h in list(vault_guard.hot.items()):
+    for tid, records in list(vault_guard.hot.items()):
         entry = _state["tabs"].get(tid)
         if entry is None:
             vault_guard.hot.pop(tid, None)
             continue
         if entry["browser_id"] != browser_id:
             continue
+        values = [v for r in records for v in r["values"]]
         try:
-            st = await vault_fill.holds(entry["tab"], h["values"])
+            st = await vault_fill.holds(entry["tab"], values)
         except Exception as e:  # noqa: BLE001
             if _is_dead_connection(e):
                 vault_guard.hot.pop(tid, None)
             else:
                 holding.append(tid)
             continue
-        if st["found"] or st["t"] == h["t"]:
+        # Records stay until the tab closes: back/forward can bring a filled
+        # document back from the cache, value and all.
+        if st["found"] or any(st["t"] == r["t"] for r in records):
             holding.append(tid)
-        else:
-            vault_guard.hot.pop(tid, None)
     return holding
 
 
@@ -2546,14 +2547,15 @@ async def _vault_gate(tool: str, args: dict[str, Any]) -> None:
         return
     bid = entry["browser_id"]
     injecting = vault_guard.is_injecting(tool, args)
-    if vault_guard.hot and (injecting or tool not in vault_guard.ALLOWED_WHILE_HOT):
+    if vault_guard.hot and not vault_guard.allowed_while_hot(tool, args):
         holding = await _hot_tabs_in(bid)
         if holding:
             raise ToolError(
                 f"refused: {', '.join(holding)} holds a secret filled by fill_secret. "
-                "Until the page is replaced, only these tools work in this browser: "
+                "While that page is current, only these tools work in this browser: "
                 + ", ".join(sorted(vault_guard.ALLOWED_WHILE_HOT))
-                + ". Submit the form, then navigate or reload to continue.")
+                + " (wait_for without selector). Submit the form, then navigate or "
+                "reload to continue.")
     if injecting:
         # Stamped before the call: the code may start running before it returns.
         vault_guard.dirty_epoch[bid] = time.time() * 1000
@@ -2580,10 +2582,10 @@ async def _stale_pages(browser_id: str) -> list[str]:
         eng = _state["routes"].get(tid)
         if e["browser_id"] != browser_id or eng is None:
             continue
-        if eng.har_replay_index or any(r.enabled and r.action in vault_guard.UNSAFE_ROUTE_ACTIONS
-                                       for r in eng.rules):
-            stale.append(f"{tid} (route rules that fulfill/modify/redirect or HAR replay: "
-                         "route_remove / har_clear first)")
+        if (eng.har_replay_index or eng.har_recording
+                or not all(vault_guard.route_is_safe(r) for r in eng.rules)):
+            stale.append(f"{tid} (route rules other than plain block, or HAR record/"
+                         "replay: route_remove / har_record_stop / har_clear first)")
     return stale
 
 
@@ -2638,9 +2640,9 @@ async def fill_secret(tab_id: str, name: str,
     ['totp'] on a 2FA step. submit=True submits the form in the same call.
 
     After a fill, every page-reading tool (evaluate, extract_*, screenshot,
-    aria_snapshot, network/HAR…) is refused in this browser until the page is
-    replaced: submit, then navigate/reload. Clicks, keys, waits and navigation
-    keep working. Refused when evaluate/inject_css ran in a page that is still
+    aria_snapshot, find_by_text, network/HAR, handoff…) is refused in this
+    browser while the filled page is current: submit, then navigate/reload.
+    Clicks, keys, wait_for(url/network) and navigation keep working. Refused when evaluate/inject_css ran in a page that is still
     open in this browser — reload or close those pages first (or log in from a
     fresh `browser_id`).
 
@@ -2689,8 +2691,9 @@ async def fill_secret(tab_id: str, name: str,
     # Registered before the fill: if it half-succeeds the value is already guarded.
     vault_guard.register(entry.password, name)
     secret_vals = [values[f] for f in ("password", "totp") if f in values]
+    record = {"values": secret_vals, "t": st["t"]}
     if secret_vals:
-        vault_guard.hot[tab_id] = {"values": secret_vals, "t": st["t"]}
+        vault_guard.hot.setdefault(tab_id, []).append(record)
     try:
         res = await vault_fill.fill(
             tab, origin=origin, fields=want, values=values, submit=submit,
@@ -2698,8 +2701,10 @@ async def fill_secret(tab_id: str, name: str,
                        "totp": totp_selector})
     except Exception:  # noqa: BLE001
         return refuse("fill failed inside the page")
-    if not set(res.get("filled", [])) & {"password", "totp"}:
-        vault_guard.hot.pop(tab_id, None)
+    if secret_vals and not set(res.get("filled", [])) & {"password", "totp"}:
+        vault_guard.hot[tab_id].remove(record)
+        if not vault_guard.hot[tab_id]:
+            vault_guard.hot.pop(tab_id)
     vault_guard.audit(entry=name, tab=tab_id, origin=origin,
                       result="filled" if res.get("ok") else "partial",
                       filled=res.get("filled"), submitted=res.get("submitted"))

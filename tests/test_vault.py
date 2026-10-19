@@ -185,6 +185,10 @@ def test_redaction_variants_and_nesting():
     assert "[redacted:site]" in guard.redact_text("pwd=p%40ss%20w%22rd%2F1")       # quote
     assert "[redacted:site]" in guard.redact_text("pwd=p%40ss+w%22rd%2F1")         # quote_plus
     assert "[redacted:site]" in guard.redact_text(json.dumps({"p": pw}))           # JSON body
+    import base64 as _b64
+    import html as _html
+    assert "[redacted:site]" in guard.redact_text(_html.escape(pw))
+    assert "[redacted:site]" in guard.redact_text(_b64.b64encode(pw.encode()).decode())
     out = guard.redact({"a": [pw, {"b": pw}], "n": 3})
     assert pw not in json.dumps(out) and out["n"] == 3
 
@@ -267,9 +271,10 @@ async def test_gate_blocks_readers_while_secret_in_page(fake_tabs, monkeypatch):
     async def holds(_tab, _values):
         return {"found": True, "t": 1.0}
     monkeypatch.setattr(server.vault_fill, "holds", holds)
-    guard.hot["t0"] = {"values": ["s3cret-pw"], "t": 1.0}
+    guard.hot["t0"] = [{"values": ["s3cret-pw"], "t": 1.0}]
 
-    for tool in ("evaluate", "extract_markdown", "screenshot", "aria_snapshot", "har_dump"):
+    for tool in ("evaluate", "extract_markdown", "screenshot", "aria_snapshot", "har_dump",
+                 "handoff_start", "request_user_input", "find_by_text", "wait_for_text"):
         with pytest.raises(ToolError, match="holds a secret"):
             await server._vault_gate(tool, {"tab_id": "t1"})        # same browser, other tab
     with pytest.raises(ToolError):
@@ -278,18 +283,34 @@ async def test_gate_blocks_readers_while_secret_in_page(fake_tabs, monkeypatch):
                 "blob:https://a.com/x", "chrome://settings"):
         with pytest.raises(ToolError):
             await server._vault_gate("navigate", {"tab_id": "t0", "url": url})
+    with pytest.raises(ToolError):
+        await server._vault_gate("wait_for", {"tab_id": "t0", "selector": "input[value^=a]"})
+    await server._vault_gate("wait_for", {"tab_id": "t0", "url_contains": "/done"})
     await server._vault_gate("aria_click", {"tab_id": "t0", "idx": 3})
     await server._vault_gate("navigate", {"tab_id": "t0", "url": "https://a.com"})
     await server._vault_gate("evaluate", {"tab_id": "t9", "expression": "1"})  # other browser
 
 
-async def test_gate_releases_once_page_replaced(fake_tabs, monkeypatch):
+async def test_gate_releases_on_new_page_and_relocks_on_back(fake_tabs, monkeypatch):
+    current = {"t": 2.0}
+
     async def holds(_tab, _values):
-        return {"found": False, "t": 2.0}  # new document, value gone
+        return {"found": False, "t": current["t"]}
     monkeypatch.setattr(server.vault_fill, "holds", holds)
-    guard.hot["t0"] = {"values": ["s3cret-pw"], "t": 1.0}
-    await server._vault_gate("evaluate", {"tab_id": "t0", "expression": "1"})
-    assert "t0" not in guard.hot
+    guard.hot["t0"] = [{"values": ["s3cret-pw"], "t": 1.0}]
+    await server._vault_gate("evaluate", {"tab_id": "t0", "expression": "1"})  # new doc: ok
+    current["t"] = 1.0  # back/forward cache brings the filled document back
+    with pytest.raises(ToolError):
+        await server._vault_gate("evaluate", {"tab_id": "t0", "expression": "1"})
+
+
+def test_only_plain_block_routes_are_safe():
+    rule = lambda **k: SimpleNamespace(**{"enabled": True, "capture": 0, **k})  # noqa: E731
+    assert guard.route_is_safe(rule(action="block"))
+    assert guard.route_is_safe(rule(action="fulfill", enabled=False))
+    for unsafe in (rule(action="continue"), rule(action="tee"), rule(action="block", capture=5),
+                   rule(action="fulfill"), rule(action="modify"), rule(action="redirect")):
+        assert not guard.route_is_safe(unsafe)
 
 
 async def test_same_document_stays_locked_even_without_value(fake_tabs, monkeypatch):
@@ -297,7 +318,7 @@ async def test_same_document_stays_locked_even_without_value(fake_tabs, monkeypa
     async def holds(_tab, _values):
         return {"found": False, "t": 1.0}
     monkeypatch.setattr(server.vault_fill, "holds", holds)
-    guard.hot["t0"] = {"values": ["s3cret-pw"], "t": 1.0}
+    guard.hot["t0"] = [{"values": ["s3cret-pw"], "t": 1.0}]
     with pytest.raises(ToolError):
         await server._vault_gate("evaluate", {"tab_id": "t0", "expression": "1"})
 

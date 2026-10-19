@@ -104,10 +104,12 @@ async def test_fill_secret_flow(site, vault):
 
         # Secret in the page: readers refused, clicks/keys still allowed.
         for tool, extra in (("evaluate", {"expression": "1"}), ("extract_text", {}),
-                            ("screenshot", {}), ("aria_snapshot", {})):
+                            ("screenshot", {}), ("aria_snapshot", {}),
+                            ("wait_for", {"selector": "form", "timeout_s": 2}),
+                            ("find_by_text", {"text": "go"})):
             with pytest.raises(ToolError, match="holds a secret"):
                 await call(tool, tab_id=tab, **extra)
-        await call("wait_for", tab_id=tab, selector="form", timeout_s=2)
+        await call("wait_for", tab_id=tab, network_idle_ms=100, timeout_s=2)
 
         # Type rule: a password never goes into a visible text field.
         out = await call("fill_secret", tab_id=tab, name="site", fields=["password"],
@@ -137,6 +139,21 @@ async def test_fill_secret_refuses_other_origin(site, vault):
         assert not guard.hot
     finally:
         await call("close_browser", browser_id="vault-e2e2")
+
+
+async def test_rewriting_route_blocks_fill(site, vault):
+    spawned = await call("spawn", url=f"{site}/login", browser_id="vault-e2e4", headless=True)
+    tab = spawned["tab_id"]
+    try:
+        rule = await call("route_add", tab_id=tab, action="continue", url_pattern="/done",
+                          new_url="http://127.0.0.1:9/elsewhere")
+        out = await call("fill_secret", tab_id=tab, name="site")
+        assert out["ok"] is False and any("route rules" in p for p in out["pages"])
+        await call("route_remove", tab_id=tab, rule_id=rule["installed"]["id"])
+        out = await call("fill_secret", tab_id=tab, name="site")
+        assert out["ok"] is True
+    finally:
+        await call("close_browser", browser_id="vault-e2e4")
 
 
 async def test_isolated_world_bypasses_page_setter(site, vault):

@@ -73,6 +73,10 @@ _FILL_JS = "(function(a){" + _DEEP + r"""
     const el = target[f];
     if (!el) { missing.push(f); continue; }
     if (!ok[f](el)) { refused.push(f + ' (field is type ' + (kind(el) || el.tagName.toLowerCase()) + ')'); continue; }
+    // A same-origin-reachable iframe can still be another origin (document.domain).
+    let fieldOrigin = null;
+    try { fieldOrigin = el.ownerDocument.defaultView.location.origin; } catch (e) {}
+    if (fieldOrigin !== a.origin) { refused.push(f + ' (field is in a frame of another origin)'); continue; }
     el.focus();
     setter.call(el, a.values[f]);
     el.dispatchEvent(new Event('input', {bubbles: true}));

@@ -13,6 +13,8 @@ Four mechanisms, all process-wide:
 from __future__ import annotations
 
 import asyncio
+import base64
+import html
 import json
 import logging
 import os
@@ -29,8 +31,10 @@ _MIN_REDACT_LEN = 4
 # variant string → entry name
 _variants: dict[str, str] = {}
 
-# tab_id → {"values": [...], "time_origin": float}  (page that holds a secret)
-hot: dict[str, dict[str, Any]] = {}
+# tab_id → one record per document a secret was filled into:
+# [{"values": [...], "t": performance.timeOrigin of that document}, ...]
+# Kept until the tab closes: back/forward can restore a filled document.
+hot: dict[str, list[dict[str, Any]]] = {}
 
 # browser_id → epoch ms of the last agent-code call in that browser
 dirty_epoch: dict[str, float] = {}
@@ -39,19 +43,29 @@ dirty_epoch: dict[str, float] = {}
 # values) inside a page. navigate counts only for javascript: URLs.
 INJECTING = frozenset({"evaluate", "inject_css"})
 
-# Route actions that let the agent serve its own content on a real origin.
-UNSAFE_ROUTE_ACTIONS = frozenset({"fulfill", "modify", "redirect"})
+def route_is_safe(rule: Any) -> bool:
+    """Only a plain block is harmless next to a login. Every other action can
+    serve, rewrite or re-target traffic on the real origin, and a capture
+    buffer records request bodies."""
+    return not rule.enabled or (rule.action == "block" and not rule.capture)
+
 
 # What a tab-scoped tool may do while a secret sits in a page of the same
-# browser: move, click, type keys, wait, navigate, hand to a human. Nothing
-# here returns page content or runs agent code.
+# browser: click, type keys, wait for navigation, navigate. Nothing here
+# returns page content, runs agent code, or answers a question about the DOM
+# (a text/selector match can be asked one character at a time).
 ALLOWED_WHILE_HOT = frozenset({
     "fill_secret", "secrets_list",
     "aria_click", "click_at", "press_key", "hover", "scroll", "element_rect",
-    "find_by_text", "find_all_by_text", "wait_for", "wait_for_text",
-    "navigate", "back", "forward", "reload", "close", "switch_tab", "list_tabs",
-    "handoff_start", "handoff_wait", "request_user_input",
+    "wait_for", "navigate", "back", "forward", "reload", "close",
+    "switch_tab", "list_tabs",
 })
+
+
+def allowed_while_hot(tool: str, args: dict[str, Any]) -> bool:
+    if tool not in ALLOWED_WHILE_HOT or is_injecting(tool, args):
+        return False
+    return not (tool == "wait_for" and args.get("selector"))
 
 
 # Schemes that only ever load a new document. Anything else (javascript:,
@@ -76,7 +90,12 @@ def is_injecting(tool: str, args: dict[str, Any]) -> bool:
 def register(value: str, label: str) -> None:
     if not value or len(value) < _MIN_REDACT_LEN:
         return
-    for v in {value, json.dumps(value)[1:-1], quote(value, safe=""), quote_plus(value)}:
+    raw = value.encode()
+    forms = {value, json.dumps(value)[1:-1], quote(value, safe=""), quote_plus(value),
+             html.escape(value), base64.b64encode(raw).decode(),
+             base64.b64encode(raw).decode().rstrip("="),
+             base64.urlsafe_b64encode(raw).decode().rstrip("=")}
+    for v in forms:
         _variants[v] = label
 
 
