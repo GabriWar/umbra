@@ -22,6 +22,7 @@
   TLS                tls_fetch  (raw HTTP w/ Chrome JA3, skip browser entirely)
   Search             web_search  (built-in meta-search: dorks × ddg/bing/brave/google → ranked)
   Session            session_save / session_load / session_list / session_delete
+  Vault              secrets_list / fill_secret  (stored logins filled without the agent seeing them)
   Meta               set_verbosity / list_browsers / kill_all / close_browser
 
 EVERY tool response goes through `_compact()` which:
@@ -57,12 +58,17 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import Middleware
 
 from umbra.browser import StealthBrowser, StealthOptions
 from umbra.proxypool import ProxyPool, parse_proxy_url
 from umbra.driver.aria import _FIELD_ROLES, AriaDriver
 from umbra.driver import utils as tab_utils
 from umbra.driver.intercept import RouteEngine, load_har_text
+from umbra.vault import fill as vault_fill
+from umbra.vault import guard as vault_guard
+from umbra.vault import store as vault_store
 
 log = logging.getLogger("umbra.server")
 
@@ -122,6 +128,8 @@ LOGIN / CAPTCHA / 2FA WALL
   → `request_user_input` (or handoff_start + handoff_wait pair to announce
                          the URL first) — pops a public live-view URL, user
                          solves, you resume.
+  → `secrets_list` + `fill_secret` when the user stored the login with umbra:
+                         you name the entry, umbra fills it, you never see it.
   → After login: `session_save` + `session_load` to skip the wall next time.
 
 DETECTED / FLAGGED
@@ -193,7 +201,23 @@ Multi-browser: pass `browser_id` to spawn for parallel isolated sessions.
 Default browser is created lazily on first spawn() with no browser_id.
 """
 
-mcp = FastMCP("umbra", instructions=_SERVER_INSTRUCTIONS)
+@contextlib.asynccontextmanager
+async def _lifespan(_server: Any) -> Any:
+    """Opens the vault unlock socket for the life of the server."""
+    from umbra.vault import unlock as vault_unlock
+    srv = None
+    try:
+        srv = await vault_unlock.serve()
+    except OSError as e:
+        log.warning("vault unlock socket unavailable: %s", e)
+    try:
+        yield {}
+    finally:
+        if srv is not None:
+            await vault_unlock.stop(srv)
+
+
+mcp = FastMCP("umbra", instructions=_SERVER_INSTRUCTIONS, lifespan=_lifespan)
 
 # Process-wide state — multi-browser orchestration. One server can drive
 # many isolated Chrome processes (different IPs, profiles, identities).
@@ -2482,6 +2506,207 @@ async def web_search(query: str, dorks: list[str] | None = None,
 
 
 # ═════════════════════════════════════════════════════════════════════════
+# Vault — fill credentials the agent never sees (umbra.vault)
+# ═════════════════════════════════════════════════════════════════════════
+
+async def _hot_tabs_in(browser_id: str) -> list[str]:
+    """Tabs of this browser whose page still holds a filled secret. A page
+    counts as holding it until its document is replaced AND no input carries
+    the value any more. Unreadable pages count as holding it (fail closed)."""
+    holding: list[str] = []
+    for tid, h in list(vault_guard.hot.items()):
+        entry = _state["tabs"].get(tid)
+        if entry is None:
+            vault_guard.hot.pop(tid, None)
+            continue
+        if entry["browser_id"] != browser_id:
+            continue
+        try:
+            st = await vault_fill.holds(entry["tab"], h["values"])
+        except Exception as e:  # noqa: BLE001
+            if _is_dead_connection(e):
+                vault_guard.hot.pop(tid, None)
+            else:
+                holding.append(tid)
+            continue
+        if st["found"] or st["t"] == h["t"]:
+            holding.append(tid)
+        else:
+            vault_guard.hot.pop(tid, None)
+    return holding
+
+
+async def _vault_gate(tool: str, args: dict[str, Any]) -> None:
+    """Runs before every tool call (middleware + batch). Refuses page-reading
+    tools while a secret sits in a page of the same browser, and records when
+    agent code last ran in a browser."""
+    tab_id = args.get("tab_id")
+    entry = _state["tabs"].get(tab_id) if isinstance(tab_id, str) else None
+    if entry is None:
+        return
+    bid = entry["browser_id"]
+    injecting = vault_guard.is_injecting(tool, args)
+    if vault_guard.hot and (injecting or tool not in vault_guard.ALLOWED_WHILE_HOT):
+        holding = await _hot_tabs_in(bid)
+        if holding:
+            raise ToolError(
+                f"refused: {', '.join(holding)} holds a secret filled by fill_secret. "
+                "Until the page is replaced, only these tools work in this browser: "
+                + ", ".join(sorted(vault_guard.ALLOWED_WHILE_HOT))
+                + ". Submit the form, then navigate or reload to continue.")
+    if injecting:
+        # Stamped before the call: the code may start running before it returns.
+        vault_guard.dirty_epoch[bid] = time.time() * 1000
+
+
+async def _stale_pages(browser_id: str) -> list[str]:
+    """Pages in this browser that may still run agent-supplied code: documents
+    older than the last evaluate/inject_css, plus tabs whose route rules serve
+    or rewrite content (a fake login page on the real origin)."""
+    epoch = vault_guard.dirty_epoch.get(browser_id, 0.0)
+    labels = {id(e["tab"]): tid for tid, e in _state["tabs"].items()}
+    stale: list[str] = []
+    for t in list(_state["browsers"][browser_id].browser.tabs):
+        label = labels.get(id(t)) or str(getattr(getattr(t, "target", None), "url", "?"))
+        try:
+            st = await vault_fill.page_state(t)
+        except Exception as e:  # noqa: BLE001
+            if not _is_dead_connection(e):
+                stale.append(f"{label} (could not inspect it)")
+            continue
+        if st["t"] < epoch:
+            stale.append(f"{label} (evaluate/inject_css ran while it was open: reload or close it)")
+    for tid, e in _state["tabs"].items():
+        eng = _state["routes"].get(tid)
+        if e["browser_id"] != browser_id or eng is None:
+            continue
+        if eng.har_replay_index or any(r.enabled and r.action in vault_guard.UNSAFE_ROUTE_ACTIONS
+                                       for r in eng.rules):
+            stale.append(f"{tid} (route rules that fulfill/modify/redirect or HAR replay: "
+                         "route_remove / har_clear first)")
+    return stale
+
+
+class _VaultMiddleware(Middleware):
+    """Gate before every MCP/REST tool call; redact results and errors after."""
+
+    async def on_call_tool(self, context: Any, call_next: Any) -> Any:
+        msg = context.message
+        await _vault_gate(msg.name, msg.arguments or {})
+        try:
+            result = await call_next(context)
+        except Exception as e:
+            redacted = vault_guard.redact_text(str(e))
+            if redacted != str(e):
+                raise ToolError(redacted) from None
+            raise
+        for block in result.content or []:
+            if isinstance(getattr(block, "text", None), str):
+                block.text = vault_guard.redact_text(block.text)
+        if result.structured_content is not None:
+            result.structured_content = vault_guard.redact(result.structured_content)
+        return result
+
+
+mcp.add_middleware(_VaultMiddleware())
+
+
+@mcp.tool()
+async def secrets_list() -> dict[str, Any]:
+    """Credentials umbra can fill for you, by name + allowed origins. Values and
+    usernames are never shown. Names: plain = local vault, `kr:` = system
+    keyring, `bw:` = Bitwarden. A locked local vault is unlocked only by the
+    human (`python -m umbra vault unlock` in their terminal) — ask them.
+
+    Ex: secrets_list() → {"entries":[{"name":"github","origins":["https://github.com"],
+        "backend":"local","has_totp":true,"confirm":false}],"local":{"state":"unlocked"}}"""
+    return _compact(await asyncio.to_thread(vault_store.list_public))
+
+
+@mcp.tool()
+async def fill_secret(tab_id: str, name: str,
+                      fields: list[Literal["username", "password", "totp"]] | None = None,
+                      username_selector: str | None = None,
+                      password_selector: str | None = None,
+                      totp_selector: str | None = None,
+                      submit: bool = False) -> dict[str, Any]:
+    """Fill a stored login into the page without you ever seeing it. umbra
+    checks the page origin against the entry, finds the fields (or uses the
+    selectors), fills them and answers with field NAMES only.
+
+    `fields` defaults to username+password (whichever the entry has); pass
+    ['totp'] on a 2FA step. submit=True submits the form in the same call.
+
+    After a fill, every page-reading tool (evaluate, extract_*, screenshot,
+    aria_snapshot, network/HAR…) is refused in this browser until the page is
+    replaced: submit, then navigate/reload. Clicks, keys, waits and navigation
+    keep working. Refused when evaluate/inject_css ran in a page that is still
+    open in this browser — reload or close those pages first (or log in from a
+    fresh `browser_id`).
+
+    Ex: fill_secret('t0', 'github', submit=True) → {"ok":true,"filled":["username","password"],"submitted":true}
+    Ex: fill_secret('t0', 'github', fields=['totp'], submit=True)"""
+    tab = _get_tab(tab_id)
+    bid = _state["tabs"][tab_id]["browser_id"]
+    origin = "?"
+
+    def refuse(why: str, **extra: Any) -> dict[str, Any]:
+        vault_guard.audit(entry=name, tab=tab_id, origin=origin, result="refused", why=why)
+        return _compact({"ok": False, "why": why, **extra})
+
+    try:
+        st = await vault_fill.page_state(tab)
+    except Exception:  # noqa: BLE001
+        return refuse("could not read the page origin")
+    origin = st["origin"]
+    try:
+        entry = await asyncio.to_thread(vault_store.resolve, name)
+    except vault_store.VaultError as e:
+        return refuse(str(e))
+    if not vault_store.origin_allowed(origin, entry.origins):
+        return refuse(f"{origin} is not an allowed origin for {name!r}", allowed=entry.origins)
+    stale = await _stale_pages(bid)
+    if stale:
+        return refuse("agent code may still be running in this browser", pages=stale)
+
+    want = list(fields) if fields else [f for f in ("username", "password") if getattr(entry, f)]
+    values: dict[str, str] = {}
+    for f in want:
+        if f == "totp":
+            if not entry.totp:
+                return refuse(f"{name!r} has no TOTP seed")
+            values[f] = vault_store.totp_now(entry.totp)
+        elif not getattr(entry, f):
+            return refuse(f"{name!r} has no {f}")
+        else:
+            values[f] = getattr(entry, f)
+
+    if entry.confirm:
+        ok, why = await vault_guard.confirm(name, origin)
+        if not ok:
+            return refuse(why)
+
+    # Registered before the fill: if it half-succeeds the value is already guarded.
+    vault_guard.register(entry.password, name)
+    secret_vals = [values[f] for f in ("password", "totp") if f in values]
+    if secret_vals:
+        vault_guard.hot[tab_id] = {"values": secret_vals, "t": st["t"]}
+    try:
+        res = await vault_fill.fill(
+            tab, origin=origin, fields=want, values=values, submit=submit,
+            selectors={"username": username_selector, "password": password_selector,
+                       "totp": totp_selector})
+    except Exception:  # noqa: BLE001
+        return refuse("fill failed inside the page")
+    if not set(res.get("filled", [])) & {"password", "totp"}:
+        vault_guard.hot.pop(tab_id, None)
+    vault_guard.audit(entry=name, tab=tab_id, origin=origin,
+                      result="filled" if res.get("ok") else "partial",
+                      filled=res.get("filled"), submitted=res.get("submitted"))
+    return _compact(res)
+
+
+# ═════════════════════════════════════════════════════════════════════════
 # Encrypted session save/load
 # ═════════════════════════════════════════════════════════════════════════
 
@@ -2582,6 +2807,8 @@ async def batch(
                 break
             continue
         try:
+            # Inner calls skip the MCP middleware, so the vault gate runs here.
+            await _vault_gate(tool_name, args)
             data = await tool_obj.fn(**args)
             elapsed_ms = int((_t.perf_counter() - call_t0) * 1000)
             results.append({"tool": tool_name, "ok": True, "data": data,
@@ -3091,6 +3318,8 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(vault_guard.RedactingFilter())
     log = logging.getLogger("umbra.server")
 
     # Startup: kill orphan chromes from prior runs (always safe — only kills

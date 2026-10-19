@@ -4,6 +4,7 @@
     python -m umbra --status
     python -m umbra --uninstall
     python -m umbra server [server-args ...]
+    python -m umbra vault {add,list,rm,unlock,lock,import-bitwarden,audit}
 
 `--setup` is the friendly alias for `umbra-cloak-setup` — fetches the
 CloakBrowser patched chromium build, sha256-verifies it, caches it under
@@ -23,6 +24,7 @@ umbra — stealth Chrome automation
   python -m umbra --status                        show cloak install state (no net)
   python -m umbra --uninstall                     wipe ~/.umbra/cloak/
   python -m umbra server [args]                   start the MCP / HTTP server
+  python -m umbra vault <cmd>                     credentials umbra fills for the agent
   python -m umbra --help                          show this help
 
 Equivalent dedicated CLIs (installed by pip):
@@ -46,6 +48,10 @@ def main(argv: list[str] | None = None) -> int:
         sys.argv = ["umbra-server", *argv[1:]]
         server_main()
         return 0
+
+    if argv[0] == "vault":
+        from umbra.vault.cli import main as vault_main
+        return vault_main(argv[1:])
 
     # Cloak passthrough — strip a leading "--setup" since the cloak CLI
     # treats install as the default action.
