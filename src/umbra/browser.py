@@ -238,6 +238,58 @@ _LOW_MEMORY_FLAGS: tuple[str, ...] = (
 )
 
 
+# Chromium keeps only the LAST occurrence of a switch, so two
+# `--enable-features=` flags silently drop the first list. These list-valued
+# switches are merged instead; each maps to its opposite.
+_LIST_SWITCHES: dict[str, str] = {
+    "--enable-features": "--disable-features",
+    "--disable-features": "--enable-features",
+    "--enable-blink-features": "--disable-blink-features",
+    "--disable-blink-features": "--enable-blink-features",
+}
+
+
+def finalize_flags(flags: list[str]) -> list[str]:
+    """Resolve a flag list so that LATER flags win, explicitly:
+
+    - list switches (--enable-features, --disable-features, blink variants)
+      are merged into one occurrence each; naming a feature in the opposite
+      list later removes it from the earlier one
+    - any other repeated `--switch[=value]` keeps only its last occurrence
+    - `!--switch` drops every earlier occurrence of `--switch`
+    """
+    lists: dict[str, list[str]] = {}
+    out: list[str] = []
+    for f in flags:
+        if f.startswith("!--"):
+            name = f[1:].partition("=")[0]
+            out = [o for o in out if o.partition("=")[0] != name]
+            lists.pop(name, None)
+            continue
+        name, _, value = f.partition("=")
+        if name in _LIST_SWITCHES:
+            if name not in lists:
+                lists[name] = []
+                out.append(name)  # placeholder, filled below
+            other = lists.get(_LIST_SWITCHES[name], [])
+            for item in value.split(","):
+                if not item:
+                    continue
+                if item in other:
+                    other.remove(item)
+                if item not in lists[name]:
+                    lists[name].append(item)
+            continue
+        if name.startswith("--"):
+            out = [o for o in out if o.partition("=")[0] != name]
+        out.append(f)
+    return [
+        (f"{o}={','.join(lists[o])}" if o in lists else o)
+        for o in out
+        if not (o in lists and not lists[o])
+    ]
+
+
 @dataclass
 class StealthOptions:
     """Configuration for a stealth Chrome session."""
@@ -313,6 +365,8 @@ class StealthBrowser:
 
     def __init__(self, options: StealthOptions | None = None):
         self.options = options or StealthOptions()
+        # Flags umbra passed to Chrome (after merging), set by start().
+        self.launch_flags: list[str] = []
         self._browser: uc.Browser | None = None
         self._tabs: list[Any] = []
         # The tab Chrome opens on launch (already stealth-configured). The
@@ -461,7 +515,7 @@ class StealthBrowser:
 
     async def start(self) -> uc.Browser:
         opts = self.options
-        flags: list[str] = list(_BASE_FLAGS) + list(opts.extra_args)
+        flags: list[str] = list(_BASE_FLAGS)
 
         # Headless mode: force --headless=new with ANGLE/Vulkan so the GPU
         # process uses the host's REAL GPU (not SwiftShader). Eliminates the
@@ -591,6 +645,9 @@ class StealthBrowser:
             if opts.profile_directory:
                 flags.append(f"--profile-directory={opts.profile_directory}")
 
+        # User flags go last so they override anything umbra set above.
+        flags[:] = finalize_flags(flags + list(opts.extra_args))
+        self.launch_flags = list(flags)
         config = uc.Config(
             headless=opts.headless,
             user_data_dir=opts.user_data_dir,
@@ -598,6 +655,13 @@ class StealthBrowser:
             browser_executable_path=opts.chrome_path,
             browser_args=flags,
         )
+        # `!--switch` also strips nodriver's own defaults (e.g. its
+        # --disable-blink-features=AutomationControlled), so any flag can go.
+        drops = {a[1:].partition("=")[0] for a in opts.extra_args if a.startswith("!--")}
+        if drops:
+            config._default_browser_args = [
+                a for a in config._default_browser_args if a.partition("=")[0] not in drops
+            ]
         log.info("Launching Chrome (headless=%s, args=%d)", opts.headless, len(flags))
         self._browser = await uc.start(config=config)
         # nodriver auto-creates a temp profile when user_data_dir=None and

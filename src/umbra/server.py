@@ -518,6 +518,7 @@ async def spawn(
     user_data_dir: str | None = None,
     profile_directory: str | None = None,
     extensions: list[str] | None = None,
+    extra_args: list[str] | None = None,
 ) -> dict[str, Any]:
     """Open stealth tab. browser_id='alice'=isolated Chrome (own cookies/identity, ~1.5s boot).
     For same-identity new pages prefer `navigate` (cheaper). stealth_mode='minimal'
@@ -554,7 +555,14 @@ async def spawn(
     chromium: 'cloak' (default) auto-downloads CloakBrowser's patched chromium
     (C++ fingerprint patches — beats JS shims). 'stock'=system chromium.
     Pass an absolute path to use a custom binary. Env: UMBRA_NO_CLOAK=1 forces
-    stock; UMBRA_CLOAK_BINARY=<path> uses that as cloak. See cloak_status."""
+    stock; UMBRA_CLOAK_BINARY=<path> uses that as cloak. See cloak_status.
+
+    `extra_args`: extra Chrome flags, applied last so they override umbra's,
+    stealth ones included. e.g. ['--enable-unsafe-webgpu', '--window-size=800,600'].
+    --enable-features/--disable-features (and blink variants) are merged, not
+    replaced; naming a feature in the opposite list flips it. '!--switch'
+    removes a flag entirely (e.g. '!--disable-blink-features').
+    Only applies when the browser is launched; verify with `browser_flags`."""
     pool = _state.get("proxy_pool") if use_proxy_pool else None
     if use_proxy_pool and pool is None:
         return _compact({"error": "proxy pool empty — call proxy_pool_load first"})
@@ -565,6 +573,7 @@ async def spawn(
         chromium=chromium, user_data_dir=user_data_dir,
         profile_directory=profile_directory,
         extensions=list(extensions or []),
+        extra_args=list(extra_args or []),
     )
     bid, browser = await _get_or_create_browser(browser_id, opts)
     # Off the critical path: a weekly look for newer cloak/extension builds.
@@ -816,6 +825,25 @@ async def list_browsers() -> dict[str, Any]:
         tab_ids = [t for t, e in _state["tabs"].items() if e["browser_id"] == bid]
         out.append({"browser_id": bid, "tab_count": len(tab_ids), "tab_ids": tab_ids})
     return _compact({"browsers": out})
+
+
+@mcp.tool()
+async def browser_flags(browser_id: str = "default") -> dict[str, Any]:
+    """Flags a browser was launched with: `umbra` = what umbra passed (after
+    merging/overrides), `cmdline` = the real process command line (includes
+    flags added by nodriver or a launcher wrapper script).
+
+    Ex: browser_flags('phisteer') → {"umbra":["--no-first-run",...],"cmdline":[...]}"""
+    browser = _state["browsers"].get(browser_id)
+    if browser is None:
+        return _compact({"error": f"unknown browser_id {browser_id!r}"})
+    out: dict[str, Any] = {"umbra": browser.launch_flags}
+    pid = getattr(browser._browser, "_process_pid", None)
+    if pid:
+        with contextlib.suppress(OSError):
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                out["cmdline"] = [a.decode(errors="replace") for a in fh.read().split(b"\0") if a]
+    return _compact(out)
 
 
 @mcp.tool()
