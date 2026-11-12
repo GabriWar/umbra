@@ -111,11 +111,6 @@ async def test_fill_secret_flow(site, vault):
                 await call(tool, tab_id=tab, **extra)
         await call("wait_for", tab_id=tab, network_idle_ms=100, timeout_s=2)
 
-        # Type rule: a password never goes into a visible text field.
-        out = await call("fill_secret", tab_id=tab, name="site", fields=["password"],
-                         password_selector="#note")
-        assert out["ok"] is False and out["refused"]
-
         out = await call("fill_secret", tab_id=tab, name="site", submit=True)
         assert out["submitted"] is True
         done = await call("wait_for", tab_id=tab, url_contains="/done", timeout_s=10)
@@ -167,3 +162,23 @@ async def test_isolated_world_bypasses_page_setter(site, vault):
         assert await page.evaluate("window.__setterCalls") == 0
     finally:
         await call("close_browser", browser_id="vault-e2e3")
+
+
+async def test_password_selector_fills_text_input(site, vault):
+    spawned = await call("spawn", url=f"{site}/login", browser_id="vault-e2e5", headless=True)
+    tab = spawned["tab_id"]
+    try:
+        # Without a selector a text input is never a password target.
+        out = await call("fill_secret", tab_id=tab, name="site", fields=["password"])
+        assert out["filled"] == ["password"]  # the real type=password field
+        await call("reload", tab_id=tab)
+        out = await call("fill_secret", tab_id=tab, name="site", fields=["password"],
+                         password_selector="#note")
+        assert out["ok"] is True and out["filled"] == ["password"]
+        with pytest.raises(ToolError, match="holds a secret"):
+            await call("extract_text", tab_id=tab)
+        page = server._get_tab(tab)
+        guard.hot.clear()
+        assert await page.evaluate("document.querySelector('#note').value") == PASSWORD
+    finally:
+        await call("close_browser", browser_id="vault-e2e5")

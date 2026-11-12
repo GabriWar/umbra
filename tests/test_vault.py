@@ -382,3 +382,120 @@ async def test_fill_locks_before_checking_for_agent_code(fake_tabs, monkeypatch)
     out = await (await server.mcp.get_tool("fill_secret")).fn("t0", "site")
     assert out["ok"] is False and seen["locked_during_check"] is True
     assert "t0" not in guard.hot  # refused fill releases its own lock
+
+
+# ───────────────────────────── generate ──────────────────────────────
+
+_FAKE_INFISICAL = '''#!{py}
+import json, os, sys
+state = os.environ["FAKE_INF_DIR"]
+open(os.path.join(state, "argv.log"), "a").write(json.dumps(sys.argv[1:]) + "\\n")
+a = sys.argv[1:]
+if a[:2] == ["secrets", "set"]:
+    key, _, src = a[2].partition("=@")
+    open(os.path.join(state, key), "w").write(open(src).read())
+elif a[:2] == ["secrets", "get"]:
+    p = os.path.join(state, a[2])
+    print(open(p).read() if os.path.exists(p) else "*not found*")
+elif a[:1] == ["secrets"]:
+    print(json.dumps([{{"secretKey": k, "secretValue": open(os.path.join(state, k)).read()}}
+                      for k in os.listdir(state) if k != "argv.log"]))
+'''
+
+
+@pytest.fixture
+def fake_infisical(tmp_path, monkeypatch):
+    import sys
+    bindir, state = tmp_path / "bin", tmp_path / "inf"
+    bindir.mkdir()
+    state.mkdir()
+    fake = bindir / "infisical"
+    fake.write_text(_FAKE_INFISICAL.format(py=sys.executable))
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_INF_DIR", str(state))
+    return state
+
+
+def test_generated_password_shape():
+    for _ in range(50):
+        p = store.generate_password(20)
+        assert len(p) == 20
+        assert any(c.islower() for c in p) and any(c.isupper() for c in p)
+        assert any(c.isdigit() for c in p) and any(c in store._SYMBOLS for c in p)
+    assert len(store.generate_password(4)) == 12
+
+
+def test_infisical_generate_resolve_list(fake_infisical):
+    pw = store.create("inf:APP_WRITER", ["https://app.x.com"], "me+w@x.com", 20)
+    e = store.resolve("inf:APP_WRITER")
+    assert e.password == pw and e.username == "me+w@x.com" and e.origins == ["https://app.x.com"]
+    # Value goes through a file, never argv.
+    argv = (fake_infisical / "argv.log").read_text()
+    assert pw not in argv and "APP_WRITER=@" in argv
+    listed = store.list_public()["entries"]
+    assert {"name": "inf:APP_WRITER", "backend": "infisical"}.items() <= listed[0].items()
+    assert pw not in json.dumps(listed)
+    with pytest.raises(store.VaultError, match="already exists"):
+        store.create("inf:APP_WRITER", ["https://app.x.com"], "", 20)
+
+
+def test_infisical_plain_value_is_not_an_entry(fake_infisical):
+    (fake_infisical / "PLAIN").write_text("hunter2")
+    with pytest.raises(store.VaultError, match="not an umbra entry"):
+        store.resolve("inf:PLAIN")
+    with pytest.raises(store.VaultError, match="no infisical secret"):
+        store.resolve("inf:MISSING")
+    with pytest.raises(store.VaultError, match="letters, digits"):
+        store.resolve("inf:a=b")
+
+
+def test_bw_generate_uses_rbw_generate(monkeypatch):
+    seen = []
+    monkeypatch.setattr(store, "rbw_available", lambda: True)
+    monkeypatch.setattr(store, "bw_names", lambda: ["bw:Other"])
+    monkeypatch.setattr(store, "_run", lambda cmd, **_k: seen.append(cmd) or
+                        SimpleNamespace(returncode=0, stdout="gen-pass-123\n", stderr=""))
+    assert store.create("bw:App", ["https://app.x.com"], "me", 24) == "gen-pass-123"
+    assert seen[0] == ["rbw", "generate", "--uri", "https://app.x.com", "--", "24", "App", "me"]
+    monkeypatch.setattr(store, "bw_names", lambda: ["bw:App"])
+    with pytest.raises(store.VaultError, match="already exists"):
+        store.create("bw:App", [], "", 20)
+
+
+def test_local_generate_needs_unlock():
+    with pytest.raises(store.VaultError, match="locked"):
+        store.create("app", ["https://app.x.com"], "", 20)
+    store.LocalVault.open("pp-long-enough", create=True)
+    store.unlock("pp-long-enough", minutes=1)
+    pw = store.create("app", ["https://app.x.com"], "me", 20)
+    assert store.resolve("app").password == pw
+    with pytest.raises(store.VaultError, match="already exists"):
+        store.create("app", ["https://app.x.com"], "", 20)
+
+
+async def test_secret_generate_tool_hides_password_and_writes_file(tmp_path, fake_infisical):
+    out_file = tmp_path / "creds" / ".env.users"
+    res = await server.mcp.call_tool("secret_generate", {
+        "name": "inf:clsi-lim-writer", "origins": ["dev.x.com"],
+        "username": "me+w@x.com", "out_file": str(out_file)})
+    data = res.structured_content
+    pw = store.resolve("inf:clsi-lim-writer").password
+    assert data["ok"] is True and data["origins"] == ["https://dev.x.com"]
+    assert data["out_keys"] == ["CLSI_LIM_WRITER_USERNAME", "CLSI_LIM_WRITER_PASSWORD"]
+    assert pw not in json.dumps(data) and pw not in res.content[0].text
+    text = out_file.read_text()
+    assert f"CLSI_LIM_WRITER_PASSWORD={pw}\n" in text
+    assert "CLSI_LIM_WRITER_USERNAME=me+w@x.com" in text
+    assert stat.S_IMODE(out_file.stat().st_mode) == 0o600
+    assert guard.redact_text(pw) == "[redacted:inf:clsi-lim-writer]"
+    # Second one appends, first stays.
+    await server.mcp.call_tool("secret_generate", {
+        "name": "inf:other", "origins": ["dev.x.com"], "out_file": str(out_file)})
+    assert "CLSI_LIM_WRITER_PASSWORD" in out_file.read_text()
+    assert "OTHER_PASSWORD=" in out_file.read_text()
+
+
+async def test_secret_generate_refuses_without_origin():
+    res = await server.mcp.call_tool("secret_generate", {"name": "kr:x", "origins": []})
+    assert res.structured_content["ok"] is False

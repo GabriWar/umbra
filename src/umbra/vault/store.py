@@ -1,7 +1,7 @@
 """Where credentials live: local encrypted file, system keyring, Bitwarden.
 
-Name prefix picks the store: `kr:` keyring, `bw:` Bitwarden (rbw), anything
-else the local file. Nothing in here ever returns a value to the agent; the
+Name prefix picks the store: `kr:` keyring, `bw:` Bitwarden (rbw), `inf:`
+Infisical (CLI), anything else the local file. Nothing in here ever returns a value to the agent; the
 server only hands `Entry` objects to umbra.vault.fill.
 """
 
@@ -12,7 +12,11 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import secrets
 import shutil
+import string
+import tempfile
 import struct
 import subprocess
 import time
@@ -277,6 +281,18 @@ def bw_names() -> list[str]:
     return [f"bw:{n}::{u}" if counts[n] > 1 and u else f"bw:{n}" for n, u, *_ in rows]
 
 
+def bw_generate(ref: str, origins: list[str], username: str, length: int) -> str:
+    """`rbw generate` makes and stores the password; it comes back on stdout
+    only so umbra can register it for redaction / write the out_file."""
+    if f"bw:{ref}" in bw_names():
+        raise VaultError(f"bw:{ref} already exists")
+    uri = ["--uri", origins[0]] if origins else []
+    r = _run(["rbw", "generate", *uri, "--", str(length), ref, *([username] if username else [])])
+    if r.returncode != 0 or not r.stdout.strip():
+        raise VaultError(f"rbw generate failed: {r.stderr.strip()[:200]}")
+    return r.stdout.strip()
+
+
 def bw_get(ref: str) -> Entry:
     name, _, user = ref.partition("::")
     # A locked rbw pops pinentry here: that prompt goes to the human, not us.
@@ -306,6 +322,149 @@ def parse_bitwarden_export(text: str) -> list[Entry]:
     return out
 
 
+# ───────────────────────────── Infisical ──────────────────────────────
+# One secret per entry, its value the entry as JSON ({origins, username,
+# password, totp, confirm}). Scope from UMBRA_INFISICAL_ENV (default dev),
+# UMBRA_INFISICAL_PATH (default /) and UMBRA_INFISICAL_PROJECT_ID (else the
+# CLI's own .infisical.json / login context).
+
+_INF_KEY = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+
+
+def infisical_available() -> bool:
+    return shutil.which("infisical") is not None
+
+
+def _inf_scope() -> list[str]:
+    args = ["--env", os.environ.get("UMBRA_INFISICAL_ENV", "dev"),
+            "--path", os.environ.get("UMBRA_INFISICAL_PATH", "/"), "--silent"]
+    if pid := os.environ.get("UMBRA_INFISICAL_PROJECT_ID"):
+        args += ["--projectId", pid]
+    return args
+
+
+def _inf_key(key: str) -> str:
+    if not _INF_KEY.match(key):
+        raise VaultError(f"infisical key {key!r} must be letters, digits, _ . -")
+    return key
+
+
+def _inf_entry(key: str, value: str) -> Entry | None:
+    try:
+        data = json.loads(value)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or "origins" not in data:
+        return None
+    fields = {f: data[f] for f in ("origins", "username", "password", "totp", "confirm") if f in data}
+    return Entry(name="inf:" + key, **fields)
+
+
+def infisical_get(key: str) -> Entry:
+    r = _run(["infisical", "secrets", "get", _inf_key(key), "--plain", "--expand=false",
+              *_inf_scope()], timeout=30)
+    value = r.stdout.strip()
+    if r.returncode != 0 or not value or value == "*not found*":
+        raise VaultError(f"no infisical secret named {key!r}"
+                         + (f": {r.stderr.strip()[:200]}" if r.returncode else ""))
+    entry = _inf_entry(key, value)
+    if entry is None:
+        raise VaultError(f"inf:{key} is not an umbra entry (needs a JSON value with "
+                         "origins/username/password); create one with secret_generate")
+    return entry
+
+
+def infisical_put(entry: Entry) -> None:
+    key = _inf_key(entry.name.removeprefix("inf:"))
+    body = json.dumps({f: v for f, v in asdict(entry).items() if f != "name"})
+    # KEY=@file keeps the value out of argv (ps is readable by the agent).
+    with tempfile.TemporaryDirectory(prefix="umbra-inf-") as d:
+        f = Path(d) / "v"
+        fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(body)
+        r = _run(["infisical", "secrets", "set", f"{key}=@{f}", *_inf_scope()], timeout=60)
+    if r.returncode != 0:
+        raise VaultError(f"infisical secrets set failed: {r.stderr.strip()[:200]}")
+
+
+def infisical_entries() -> list[Entry]:
+    r = _run(["infisical", "secrets", "-o", "json", "--expand=false", *_inf_scope()], timeout=30)
+    if r.returncode != 0:
+        return []
+    try:
+        rows = json.loads(r.stdout)
+    except ValueError:
+        return []
+    out = []
+    for row in rows if isinstance(rows, list) else []:
+        key = row.get("secretKey") or row.get("key") or ""
+        e = _inf_entry(key, row.get("secretValue") or row.get("value") or "")
+        if e is not None:
+            out.append(e)
+    return out
+
+
+# ───────────────────────────── generate ──────────────────────────────
+
+_SYMBOLS = "!@#%^*-_"
+
+
+def generate_password(length: int = 20) -> str:
+    """Letters + digits + a few symbols most sites accept; one of each class."""
+    length = max(12, min(length, 128))
+    alphabet = string.ascii_letters + string.digits + _SYMBOLS
+    while True:
+        p = "".join(secrets.choice(alphabet) for _ in range(length))
+        if (any(c.islower() for c in p) and any(c.isupper() for c in p)
+                and any(c.isdigit() for c in p) and any(c in _SYMBOLS for c in p)):
+            return p
+
+
+def exists(name: str) -> bool:
+    try:
+        resolve(name)
+    except VaultError:
+        return False
+    return True
+
+
+def create(name: str, origins: list[str], username: str, length: int) -> str:
+    """Generate a password, store a new entry under `name`, return the password
+    (to the server only — it never goes into a tool result). Refuses to
+    overwrite an existing entry."""
+    if any(part.startswith("-") for part in name.split(":", 1)[-1].split("::")):
+        raise VaultError("entry names may not start with '-'")
+    if name.startswith("bw:"):
+        if not rbw_available():
+            raise VaultError("rbw not installed (`sudo pacman -S rbw`, then `rbw login`)")
+        return bw_generate(name[3:], origins, username, length)
+    password = generate_password(length)
+    entry = Entry(name=name, origins=origins, username=username, password=password)
+    if name.startswith("kr:"):
+        if not keyring_available():
+            raise VaultError("secret-tool not installed (libsecret)")
+        if exists(name):
+            raise VaultError(f"{name} already exists")
+        entry.name = name[3:]
+        keyring_put(entry)
+    elif name.startswith("inf:"):
+        if not infisical_available():
+            raise VaultError("infisical CLI not installed")
+        _inf_key(name[4:])
+        if exists(name):
+            raise VaultError(f"{name} already exists")
+        infisical_put(entry)
+    else:
+        v = unlocked_vault()
+        if v is None:
+            raise VaultError("local vault is locked — use a kr:/inf:/bw: name, or ask the "
+                             "human to run `python -m umbra vault unlock`")
+        if name in v.entries():
+            raise VaultError(f"{name} already exists")
+        v.put(entry)
+    return password
+
 # ─────────────────────────────── resolve ───────────────────────────────
 
 def resolve(name: str) -> Entry:
@@ -320,6 +479,10 @@ def resolve(name: str) -> Entry:
         if not keyring_available():
             raise VaultError("secret-tool not installed (libsecret)")
         return keyring_get(name[3:])
+    if name.startswith("inf:"):
+        if not infisical_available():
+            raise VaultError("infisical CLI not installed")
+        return infisical_get(name[4:])
     v = unlocked_vault()
     if v is None:
         raise VaultError("local vault is locked — the human must run "
@@ -345,6 +508,8 @@ def list_public() -> dict[str, Any]:
                 out["entries"].append(keyring_get(n).public("keyring"))
             except VaultError:
                 continue
+    if infisical_available():
+        out["entries"] += [e.public("infisical") for e in infisical_entries()]
     if rbw_available():
         # Origins/flags need a decrypt per item; names alone are enough to pick.
         out["entries"] += [{"name": n, "backend": "bitwarden"} for n in bw_names()]

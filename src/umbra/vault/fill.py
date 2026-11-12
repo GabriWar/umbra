@@ -63,7 +63,9 @@ _FILL_JS = "(function(a){" + _DEEP + r"""
 
   const ok = {
     username: el => TEXTY.includes(kind(el)),
-    password: el => kind(el) === 'password',
+    // An explicit selector may target a text input: "set a password" fields on
+    // admin forms are often plain text. Read tools stay locked either way.
+    password: el => kind(el) === 'password' || (!!a.sel.password && TEXTY.includes(kind(el))),
     totp: el => ['text', 'tel', 'number'].includes(kind(el)),
   };
   const target = {username: user, password: pwd, totp: otp};

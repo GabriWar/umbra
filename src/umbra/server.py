@@ -23,7 +23,8 @@
   TLS                tls_fetch  (raw HTTP w/ Chrome JA3, skip browser entirely)
   Search             web_search  (built-in meta-search: dorks × ddg/bing/brave/google → ranked)
   Session            session_save / session_load / session_list / session_delete
-  Vault              secrets_list / fill_secret  (stored logins filled without the agent seeing them)
+  Vault              secrets_list / fill_secret / secret_generate  (logins filled without the agent seeing them)
+  Script             batch / script  (N calls, or loops + parallel flows, in one round-trip)
   Meta               set_verbosity / list_browsers / kill_all / close_browser
 
 EVERY tool response goes through `_compact()` which:
@@ -110,6 +111,10 @@ CLICK / TYPE / FILL FORM
   → `set_fields`        N form values in one JS pass
   → `evaluate`          supports `await` — click, sleep for the re-render, then
                         read back the result, all inside one call
+  → `script(code)`      loops/variables/parallel flows over every tool in ONE
+                        call. Doing the same flow twice (per user, per row,
+                        per page)? Script it — or call the app's own API you
+                        saw in get_network_requests.
   A form that takes 30 sequential calls usually collapses to 2-3 batched ones.
 
 WAIT FOR SOMETHING
@@ -2756,7 +2761,7 @@ mcp.add_middleware(_VaultMiddleware())
 async def secrets_list() -> dict[str, Any]:
     """Credentials umbra can fill for you, by name + allowed origins. Values and
     usernames are never shown. Names: plain = local vault, `kr:` = system
-    keyring, `bw:` = Bitwarden. A locked local vault is unlocked only by the
+    keyring, `bw:` = Bitwarden, `inf:` = Infisical. A locked local vault is unlocked only by the
     human (`python -m umbra vault unlock` in their terminal) — ask them.
 
     Ex: secrets_list() → {"entries":[{"name":"github","origins":["https://github.com"],
@@ -2785,7 +2790,15 @@ async def fill_secret(tab_id: str, name: str,
     open in this browser — reload or close those pages first (or log in from a
     fresh `browser_id`).
 
+    `password_selector` may point at a plain text input (e.g. "set password"
+    on an admin create-user form); without it only type=password is filled.
+
+    NEVER put a secret into a page any other way — not via evaluate, set_fields,
+    a script, or by connecting to the browser's devtools port yourself. If
+    fill_secret refuses, follow its `why`. New password needed? secret_generate.
+
     Ex: fill_secret('t0', 'github', submit=True) → {"ok":true,"filled":["username","password"],"submitted":true}
+    Ex: fill_secret('t0', 'kr:app-user', fields=['password'], password_selector='#newPassword')
     Ex: fill_secret('t0', 'github', fields=['totp'], submit=True)"""
     tab = _get_tab(tab_id)
     bid = _state["tabs"][tab_id]["browser_id"]
@@ -2849,7 +2862,9 @@ async def fill_secret(tab_id: str, name: str,
     stale = await _stale_pages(bid)
     if stale:
         unlock_record()
-        return refuse("agent code may still be running in this browser", pages=stale)
+        return refuse("agent code may still be running in this browser. Fix: call "
+                      "reload on each listed tab (or close it), then call fill_secret again. "
+                      "Do not work around this.", pages=stale)
     try:
         res = await vault_fill.fill(
             tab, origin=origin, fields=want, values=values, submit=submit,
@@ -2864,6 +2879,59 @@ async def fill_secret(tab_id: str, name: str,
                       result="filled" if res.get("ok") else "partial",
                       filled=res.get("filled"), submitted=res.get("submitted"))
     return _compact(res)
+
+
+@mcp.tool()
+async def secret_generate(name: str, origins: list[str], username: str = "",
+                          length: int = 20, out_file: str | None = None) -> dict[str, Any]:
+    """Create a NEW login with a random password umbra generates and stores. You
+    never see the password; use it with fill_secret (e.g. into a create-user
+    form, then into the login page). Refuses to overwrite an existing entry.
+
+    Store by name prefix: `kr:NAME` system keyring (no unlock needed — default
+    choice), `inf:KEY` Infisical, `bw:NAME` Bitwarden (rbw), plain NAME local
+    vault (only while the human has it unlocked).
+
+    out_file: also append `KEY_USERNAME=` / `KEY_PASSWORD=` lines (dotenv) to this
+    file for the human, created/kept at mode 600. Do not read that file.
+
+    Ex: secret_generate('kr:clsi-lim-writer', ['https://dev.example.com'],
+            username='me+lim_writer@example.com', out_file='~/dev/.env.test-users')
+        → {"ok":true,"name":"kr:clsi-lim-writer","out_keys":["CLSI_LIM_WRITER_USERNAME",...]}"""
+    import re as _re
+    try:
+        norm = [vault_store.normalize_origin(o) for o in origins]
+    except ValueError as e:
+        return {"ok": False, "why": str(e)}
+    if not norm:
+        return {"ok": False, "why": "pass at least one origin (where this login is used)"}
+    try:
+        password = await asyncio.to_thread(vault_store.create, name, norm, username, length)
+    except vault_store.VaultError as e:
+        vault_guard.audit(entry=name, result="generate-refused", why=str(e))
+        return {"ok": False, "why": str(e)}
+    vault_guard.register(password, name)
+    vault_guard.audit(entry=name, result="generated", origins=norm)
+    out: dict[str, Any] = {"ok": True, "name": name, "origins": norm, "username": username}
+    if out_file:
+        path = Path(out_file).expanduser()
+        key = _re.sub(r"[^A-Za-z0-9]+", "_", name.split(":", 1)[-1]).strip("_").upper()
+        lines = [f"# umbra secret_generate {name} {' '.join(norm)}"]
+        if username:
+            lines.append(f"{key}_USERNAME={username}")
+        lines.append(f"{key}_PASSWORD={password}")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a") as f:
+                os.fchmod(f.fileno(), 0o600)
+                f.write("\n".join(lines) + "\n")
+        except OSError as e:
+            out["out_file_error"] = f"stored in {name}, but writing {path} failed: {e.strerror}"
+        else:
+            out["out_file"] = str(path)
+            out["out_keys"] = [ln.split("=", 1)[0] for ln in lines[1:]]
+    return out
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -2991,6 +3059,156 @@ async def batch(
         "ok_count": ok_count,
         "fail_count": fail_count,
     }
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Script — loops, variables and parallel flows over the tool surface
+# ═════════════════════════════════════════════════════════════════════════
+
+import ast as _ast  # noqa: E402
+import builtins as _builtins  # noqa: E402
+import inspect as _inspect  # noqa: E402
+import types as _types  # noqa: E402
+import re as _re  # noqa: E402
+import traceback as _traceback  # noqa: E402
+
+_SCRIPT_BUILTINS = {n: getattr(_builtins, n) for n in (
+    "abs", "all", "any", "bool", "dict", "enumerate", "filter", "float", "int",
+    "isinstance", "len", "list", "map", "max", "min", "range", "repr", "reversed",
+    "round", "set", "sorted", "str", "sum", "tuple", "zip", "Exception",
+    "KeyError", "IndexError", "ValueError", "RuntimeError", "TimeoutError")}
+
+# Attributes that lead from a plain object to frames / module globals (and
+# from there to the vault). Every `_name` is refused on top of these.
+_SCRIPT_DENIED_ATTRS = frozenset({
+    "format", "format_map", "mro", "gi_frame", "gi_code", "gi_yieldfrom",
+    "cr_frame", "cr_code", "cr_await", "ag_frame", "ag_code", "ag_await",
+    "f_globals", "f_locals", "f_builtins", "f_back", "f_code", "tb_frame",
+    "tb_next", "func_globals", "func_code"})
+
+_SCRIPT_DENIED_NODES = (_ast.Import, _ast.ImportFrom, _ast.Global, _ast.Nonlocal,
+                        _ast.ClassDef, _ast.Yield, _ast.YieldFrom)
+
+# Functions only, never the modules: a module attribute walks to `sys`
+# (re.enum.sys.modules) and from there to everything in this process.
+_SCRIPT_JSON = _types.SimpleNamespace(dumps=json.dumps, loads=json.loads)
+_SCRIPT_RE = _types.SimpleNamespace(**{n: getattr(_re, n) for n in (
+    "search", "match", "fullmatch", "findall", "finditer", "sub", "split", "escape",
+    "IGNORECASE", "MULTILINE", "DOTALL", "I", "M", "S")})
+
+# Script calls run from inside a tool call: no nesting.
+_SCRIPT_EXCLUDED = frozenset({"script"})
+
+
+def _script_check(tree: _ast.AST) -> None:
+    for node in _ast.walk(tree):
+        line = getattr(node, "lineno", "?")
+        if isinstance(node, _SCRIPT_DENIED_NODES):
+            raise ToolError(f"line {line}: {type(node).__name__} is not allowed in scripts")
+        if isinstance(node, _ast.Attribute) and (
+                node.attr.startswith("_") or node.attr in _SCRIPT_DENIED_ATTRS):
+            raise ToolError(f"line {line}: attribute {node.attr!r} is not allowed in scripts")
+        name = (node.id if isinstance(node, _ast.Name) else node.arg if isinstance(node, _ast.arg)
+                else node.name if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+                else None)
+        if name and name.startswith("_"):
+            raise ToolError(f"line {line}: names starting with '_' are not allowed in scripts")
+
+
+class _ScriptTools:
+    """`t.<tool>(...)` → that umbra tool, gated like a direct call."""
+
+    def __init__(self, counter: list[int]):
+        self._counter = counter
+
+    def __getattr__(self, tool_name: str) -> Any:
+        if tool_name.startswith("_") or tool_name in _SCRIPT_EXCLUDED:
+            raise AttributeError(tool_name)
+
+        async def call(*a: Any, **kw: Any) -> Any:
+            try:
+                tool_obj = await mcp.get_tool(tool_name)
+            except Exception:  # noqa: BLE001
+                raise ToolError(f"unknown tool: {tool_name}") from None
+            try:
+                args = dict(_inspect.signature(tool_obj.fn).bind(*a, **kw).arguments)
+            except TypeError as e:
+                raise ToolError(f"{tool_name}: {e}") from None
+            # Inner calls skip the MCP middleware, so these gates run here.
+            await _wait_for_human(args)
+            await _vault_gate(tool_name, args)
+            self._counter[0] += 1
+            return await tool_obj.fn(**args)
+
+        return call
+
+
+@mcp.tool()
+async def script(code: str, timeout_s: float = 120) -> dict[str, Any]:
+    """Run an async Python script over umbra's tools in ONE call. Use it whenever
+    you'd repeat a flow (per user, per row, per page) or a step needs the
+    previous step's result — instead of N single calls.
+
+    In scope: `t.<tool>(...)` (every umbra tool, same args, `await` it; results
+    are the dicts a direct call returns), `print(...)` (→ `log`), `sleep(s)`,
+    `gather(*coros)` (concurrent flows: several tabs, or several browsers
+    spawned with their own `browser_id`/`proxy`), `json`, `re`, basic builtins.
+    `return x` → `result`. No imports, no `_names`. Vault rules apply to every
+    call inside (fill_secret works; reads of a filled page are refused).
+
+    Ex code:
+        out = []
+        for email in ["a+r@x.com", "a+w@x.com"]:
+            await t.navigate("t0", "https://app.x.com/users/new")
+            await t.set_fields("t0", {"#email": email, "#role": "Client"})
+            hit = await t.find_by_text("t0", "Create User", role_hint="button")
+            await t.aria_click("t0", hit["idx"])
+            out.append(await t.wait_for_text("t0", email))
+        return out
+    Ex code (parallel, own proxy each):
+        async def run(i, proxy):
+            b = await t.spawn(url="https://x.com", browser_id=f"w{i}", proxy=proxy)
+            return await t.extract_text(b["tab_id"], selector="h1")
+        return await gather(*[run(i, p) for i, p in enumerate(["http://p1:8080", "http://p2:8080"])])
+    → {"ok":true,"result":[...],"log":[...],"calls":12,"elapsed_ms":8400}"""
+    t0 = time.perf_counter()
+    try:
+        tree = _ast.parse(code, filename="<script>")
+    except SyntaxError as e:
+        return {"ok": False, "error": f"SyntaxError line {e.lineno}: {e.msg}"}
+    _script_check(tree)
+    wrapper = _ast.parse("async def _umbra_script():\n    pass")
+    wrapper.body[0].body = tree.body or [_ast.Pass()]
+    _ast.fix_missing_locations(wrapper)
+    log: list[str] = []
+    counter = [0]
+
+    def _print(*a: Any, sep: str = " ", end: str = "") -> None:
+        if len(log) < 500:
+            log.append(sep.join(x if isinstance(x, str) else json.dumps(x, default=str)
+                                for x in a)[:4000])
+
+    async def _sleep(sec: float) -> None:
+        await asyncio.sleep(max(0.0, min(float(sec), 60.0)))
+
+    async def _gather(*coros: Any) -> list[Any]:
+        return list(await asyncio.gather(*coros))
+
+    env: dict[str, Any] = {"__builtins__": _SCRIPT_BUILTINS, "t": _ScriptTools(counter),
+                           "print": _print, "sleep": _sleep, "gather": _gather,
+                           "json": _SCRIPT_JSON, "re": _SCRIPT_RE}
+    exec(compile(wrapper, "<script>", "exec"), env)  # noqa: S102 — AST checked above
+    try:
+        result = await asyncio.wait_for(env["_umbra_script"](), max(1.0, min(timeout_s, 600.0)))
+        out: dict[str, Any] = {"ok": True, "result": json.loads(json.dumps(result, default=str))}
+    except asyncio.TimeoutError:
+        out = {"ok": False, "error": f"timed out after {timeout_s:g}s"}
+    except Exception as e:  # noqa: BLE001
+        lines = [f.lineno for f in _traceback.extract_tb(e.__traceback__) if f.filename == "<script>"]
+        where = f"line {lines[-1]}: " if lines else ""
+        out = {"ok": False, "error": f"{where}{type(e).__name__}: {str(e)[:500]}"}
+    out.update(log=log, calls=counter[0], elapsed_ms=int((time.perf_counter() - t0) * 1000))
+    return out
 
 
 # ═════════════════════════════════════════════════════════════════════════
