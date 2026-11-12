@@ -281,13 +281,17 @@ def bw_names() -> list[str]:
     return [f"bw:{n}::{u}" if counts[n] > 1 and u else f"bw:{n}" for n, u, *_ in rows]
 
 
-def bw_generate(ref: str, origins: list[str], username: str, length: int) -> str:
+def bw_generate(ref: str, origins: list[str], username: str, length: int,
+                symbols: str = "!@#%^*-_") -> str:
     """`rbw generate` makes and stores the password; it comes back on stdout
     only so umbra can register it for redaction / write the out_file."""
     if f"bw:{ref}" in bw_names():
         raise VaultError(f"bw:{ref} already exists")
+    if symbols not in ("", _SYMBOLS):
+        raise VaultError("rbw can only generate with its own symbols or none (symbols='')")
     uri = ["--uri", origins[0]] if origins else []
-    r = _run(["rbw", "generate", *uri, "--", str(length), ref, *([username] if username else [])])
+    nosym = [] if symbols else ["--no-symbols"]
+    r = _run(["rbw", "generate", *uri, *nosym, "--", str(length), ref, *([username] if username else [])])
     if r.returncode != 0 or not r.stdout.strip():
         raise VaultError(f"rbw generate failed: {r.stderr.strip()[:200]}")
     return r.stdout.strip()
@@ -410,14 +414,18 @@ def infisical_entries() -> list[Entry]:
 _SYMBOLS = "!@#%^*-_"
 
 
-def generate_password(length: int = 20) -> str:
-    """Letters + digits + a few symbols most sites accept; one of each class."""
-    length = max(12, min(length, 128))
-    alphabet = string.ascii_letters + string.digits + _SYMBOLS
+def generate_password(length: int = 20, symbols: str = _SYMBOLS) -> str:
+    """Letters + digits + `symbols` (none if ""); at least one of each class.
+    Length 8..128 — sites that cap it short need the low end."""
+    symbols = "".join(dict.fromkeys(symbols))
+    if any(c.isalnum() or c.isspace() or not c.isprintable() for c in symbols):
+        raise VaultError("symbols must be printable punctuation, no letters/digits/spaces")
+    length = max(8, min(length, 128))
+    alphabet = string.ascii_letters + string.digits + symbols
     while True:
         p = "".join(secrets.choice(alphabet) for _ in range(length))
         if (any(c.islower() for c in p) and any(c.isupper() for c in p)
-                and any(c.isdigit() for c in p) and any(c in _SYMBOLS for c in p)):
+                and any(c.isdigit() for c in p) and (not symbols or any(c in symbols for c in p))):
             return p
 
 
@@ -429,7 +437,8 @@ def exists(name: str) -> bool:
     return True
 
 
-def create(name: str, origins: list[str], username: str, length: int) -> str:
+def create(name: str, origins: list[str], username: str, length: int,
+           symbols: str = _SYMBOLS) -> str:
     """Generate a password, store a new entry under `name`, return the password
     (to the server only — it never goes into a tool result). Refuses to
     overwrite an existing entry."""
@@ -438,8 +447,8 @@ def create(name: str, origins: list[str], username: str, length: int) -> str:
     if name.startswith("bw:"):
         if not rbw_available():
             raise VaultError("rbw not installed (`sudo pacman -S rbw`, then `rbw login`)")
-        return bw_generate(name[3:], origins, username, length)
-    password = generate_password(length)
+        return bw_generate(name[3:], origins, username, length, symbols)
+    password = generate_password(length, symbols)
     entry = Entry(name=name, origins=origins, username=username, password=password)
     if name.startswith("kr:"):
         if not keyring_available():

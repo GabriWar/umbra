@@ -423,7 +423,7 @@ def test_generated_password_shape():
         assert len(p) == 20
         assert any(c.islower() for c in p) and any(c.isupper() for c in p)
         assert any(c.isdigit() for c in p) and any(c in store._SYMBOLS for c in p)
-    assert len(store.generate_password(4)) == 12
+    assert len(store.generate_password(4)) == 8
 
 
 def test_infisical_generate_resolve_list(fake_infisical):
@@ -499,3 +499,26 @@ async def test_secret_generate_tool_hides_password_and_writes_file(tmp_path, fak
 async def test_secret_generate_refuses_without_origin():
     res = await server.mcp.call_tool("secret_generate", {"name": "kr:x", "origins": []})
     assert res.structured_content["ok"] is False
+
+
+def test_generate_custom_symbols_and_short_length():
+    for _ in range(50):
+        p = store.generate_password(10, symbols="$")
+        assert len(p) == 10 and "$" in p
+        assert set(p) <= set(store.string.ascii_letters + store.string.digits + "$")
+        assert store.generate_password(8, symbols="").isalnum()
+    assert len(store.generate_password(3)) == 8
+    with pytest.raises(store.VaultError, match="printable punctuation"):
+        store.generate_password(12, symbols="a!")
+
+
+def test_bw_generate_symbols(monkeypatch):
+    seen = []
+    monkeypatch.setattr(store, "rbw_available", lambda: True)
+    monkeypatch.setattr(store, "bw_names", lambda: [])
+    monkeypatch.setattr(store, "_run", lambda cmd, **_k: seen.append(cmd) or
+                        SimpleNamespace(returncode=0, stdout="x\n", stderr=""))
+    store.create("bw:A", [], "", 16, symbols="")
+    assert "--no-symbols" in seen[0]
+    with pytest.raises(store.VaultError, match="rbw can only"):
+        store.create("bw:B", [], "", 16, symbols="$")

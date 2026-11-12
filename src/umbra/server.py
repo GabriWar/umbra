@@ -2883,7 +2883,8 @@ async def fill_secret(tab_id: str, name: str,
 
 @mcp.tool()
 async def secret_generate(name: str, origins: list[str], username: str = "",
-                          length: int = 20, out_file: str | None = None) -> dict[str, Any]:
+                          length: int = 20, symbols: str = "!@#%^*-_",
+                          out_file: str | None = None) -> dict[str, Any]:
     """Create a NEW login with a random password umbra generates and stores. You
     never see the password; use it with fill_secret (e.g. into a create-user
     form, then into the login page). Refuses to overwrite an existing entry.
@@ -2891,6 +2892,9 @@ async def secret_generate(name: str, origins: list[str], username: str = "",
     Store by name prefix: `kr:NAME` system keyring (no unlock needed — default
     choice), `inf:KEY` Infisical, `bw:NAME` Bitwarden (rbw), plain NAME local
     vault (only while the human has it unlocked).
+
+    length 8..128; `symbols` = allowed punctuation ("" for letters+digits only).
+    Always at least one lowercase, uppercase, digit (and symbol, if any).
 
     out_file: also append `KEY_USERNAME=` / `KEY_PASSWORD=` lines (dotenv) to this
     file for the human, created/kept at mode 600. Do not read that file.
@@ -2906,7 +2910,8 @@ async def secret_generate(name: str, origins: list[str], username: str = "",
     if not norm:
         return {"ok": False, "why": "pass at least one origin (where this login is used)"}
     try:
-        password = await asyncio.to_thread(vault_store.create, name, norm, username, length)
+        password = await asyncio.to_thread(vault_store.create, name, norm, username, length,
+                                         symbols)
     except vault_store.VaultError as e:
         vault_guard.audit(entry=name, result="generate-refused", why=str(e))
         return {"ok": False, "why": str(e)}
