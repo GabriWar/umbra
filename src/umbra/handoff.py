@@ -63,6 +63,10 @@ button:hover { background: #27ae60; }
 img { display: block; cursor: crosshair; max-width: 100vw; image-rendering: pixelated; }
 .cursor { position: absolute; width: 12px; height: 12px; border: 2px solid #ff3333; border-radius: 50%; pointer-events: none; transform: translate(-50%, -50%); }
 #status { position: fixed; bottom: 8px; right: 12px; font-size: 11px; color: #666; }
+#kbd-btn { background: #333; }
+/* Phone keyboard target: must stay focusable (no display:none) to open the
+   soft keyboard; 16px stops iOS zooming in on focus. */
+#kbd { position: fixed; bottom: 0; left: 0; width: 1px; height: 1px; opacity: 0; font-size: 16px; border: 0; padding: 0; }
 .ok { color: #2ecc71; }
 .dead { color: #e74c3c; }
 </style>
@@ -71,8 +75,10 @@ img { display: block; cursor: crosshair; max-width: 100vw; image-rendering: pixe
 <div id="bar">
     <span id="reason">handoff active - interact with the page below</span>
     <span id="kbd-hint">click in the viewport, then keys forward</span>
+    <button id="kbd-btn" title="open keyboard">&#9000; KEYBOARD</button>
     <button id="done">I'M DONE</button>
 </div>
+<input id="kbd" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="keyboard input"/>
 <div id="viewport" tabindex="0">
     <img id="screen" alt="loading..."/>
     <div class="cursor" id="cursor" style="display:none"></div>
@@ -142,10 +148,14 @@ img.addEventListener('mousemove', e => {
     if (ws.readyState === 1) ws.send(JSON.stringify({type: 'mousemove', x: c.x, y: c.y}));
 });
 img.addEventListener('mouseleave', () => { cursor.style.display = 'none'; });
+// Tapping the screen blurs the keyboard input; note it first so the click
+// can hand focus back and the phone keyboard stays up.
+let kbdWasOpen = false;
+img.addEventListener('pointerdown', () => { kbdWasOpen = document.activeElement === kbd; });
 img.addEventListener('click', e => {
     const c = imgCoords(e);
     if (ws.readyState === 1) ws.send(JSON.stringify({type: 'click', x: c.x, y: c.y, button: 'left'}));
-    viewport.focus();
+    (kbdWasOpen ? kbd : viewport).focus();
 });
 img.addEventListener('contextmenu', e => {
     e.preventDefault();
@@ -168,6 +178,35 @@ viewport.addEventListener('wheel', e => {
     const c = imgCoords(e);
     if (ws.readyState === 1) ws.send(JSON.stringify({type: 'scroll', x: c.x, y: c.y, dx: e.deltaX, dy: e.deltaY}));
 }, { passive: false });
+
+// Phone keyboard. Soft keyboards don't send real keydowns (Android reports
+// 'Unidentified'), and autocorrect/swipe rewrite whole words, so diff the
+// input's value instead: removed chars -> Backspace, added chars -> keys.
+// A sentinel char gives Backspace something to delete when nothing's typed.
+const kbd = document.getElementById('kbd');
+const SENTINEL = ' ';
+let kbdLast = SENTINEL;
+function kbdReset() { kbd.value = SENTINEL; kbdLast = SENTINEL; }
+function sendKey(key, text) {
+    if (ws.readyState === 1) ws.send(JSON.stringify({type: 'key', key, code: '', text,
+        ctrl: false, shift: false, alt: false, meta: false}));
+}
+kbd.addEventListener('input', () => {
+    const v = kbd.value;
+    let p = 0;
+    while (p < v.length && p < kbdLast.length && v[p] === kbdLast[p]) p++;
+    for (let i = p; i < kbdLast.length; i++) sendKey('Backspace', '');
+    for (const ch of v.slice(p)) sendKey(ch, ch);
+    kbdLast = v;
+    if (!v) kbdReset();
+});
+kbd.addEventListener('keydown', e => {
+    if (!['Enter', 'Tab', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) return;
+    e.preventDefault();
+    sendKey(e.key, '');
+    if (e.key === 'Enter') kbdReset();
+});
+document.getElementById('kbd-btn').onclick = () => { kbdReset(); kbd.focus(); };
 
 document.getElementById('done').onclick = async () => {
     if (watchMode) {
