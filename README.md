@@ -42,6 +42,24 @@ pip install -e ".[all]"
 python -m umbra.server   # ctrl+c after a few seconds — verify tools register
 ```
 
+### step by step with a venv
+
+Keeps umbra's deps out of your system python.
+
+```bash
+git clone https://github.com/GabriWar/umbra.git
+cd umbra
+python3 -m venv .venv
+source .venv/bin/activate              # fish: source .venv/bin/activate.fish
+pip install -e ".[markdown]"           # core + extract_markdown (markdownify + readability)
+pip install -e ".[test]"               # optional: pytest for the regression suite
+python -c "import umbra.server, markdownify, readability; print('ok')"
+python -m umbra --setup                # optional: CloakBrowser patched chromium (see § CloakBrowser)
+echo "$PWD/.venv/bin/python"           # → paste as "command" in § MCP setup
+```
+
+The MCP client runs `.venv/bin/python` directly, so no `activate` is needed after install. Skip `[playwright]`: umbra drives Chrome itself and never imports Playwright — it's only for passing your own Playwright context to `umbra.stealth.install_playwright`.
+
 **requirements:** Python 3.10+, a Chromium-based browser (Chrome / Chromium / Edge — auto-detected).
 
 | extra | enables | install |
