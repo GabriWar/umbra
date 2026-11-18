@@ -23,7 +23,8 @@
   TLS                tls_fetch  (raw HTTP w/ Chrome JA3, skip browser entirely)
   Search             web_search  (built-in meta-search: dorks × ddg/bing/brave/google → ranked)
   Session            session_save / session_load / session_list / session_delete
-  Vault              secrets_list / fill_secret / secret_generate  (logins filled without the agent seeing them)
+  Vault              secrets_list / fill_secret / secret_generate / secret_import_env
+                     (logins filled without the agent seeing them)
   Script             batch / script  (N calls, or loops + parallel flows, in one round-trip)
   Meta               set_verbosity / list_browsers / kill_all / close_browser
 
@@ -136,6 +137,10 @@ LOGIN / CAPTCHA / 2FA WALL
                          solves, you resume.
   → `secrets_list` + `fill_secret` when the user stored the login with umbra:
                          you name the entry, umbra fills it, you never see it.
+  → `secret_import_env`  login sits in a dotenv file (KEY=value): umbra copies
+                         the named keys into the keyring (`kr:NAME`) without
+                         you seeing them, then `fill_secret`. Never read the
+                         file or push its values in via evaluate/CDP.
   → After login: `session_save` + `session_load` to skip the wall next time.
 
 DETECTED / FLAGGED
@@ -2796,6 +2801,7 @@ async def fill_secret(tab_id: str, name: str,
     NEVER put a secret into a page any other way — not via evaluate, set_fields,
     a script, or by connecting to the browser's devtools port yourself. If
     fill_secret refuses, follow its `why`. New password needed? secret_generate.
+    Login already in a dotenv file? secret_import_env first.
 
     Ex: fill_secret('t0', 'github', submit=True) → {"ok":true,"filled":["username","password"],"submitted":true}
     Ex: fill_secret('t0', 'kr:app-user', fields=['password'], password_selector='#newPassword')
@@ -2937,6 +2943,55 @@ async def secret_generate(name: str, origins: list[str], username: str = "",
             out["out_file"] = str(path)
             out["out_keys"] = [ln.split("=", 1)[0] for ln in lines[1:]]
     return out
+
+
+@mcp.tool()
+async def secret_import_env(name: str, origins: list[str], env_file: str, password_key: str,
+                            username_key: str | None = None,
+                            store: Literal["keyring", "local", "infisical"] = "keyring",
+                            replace: bool = False) -> dict[str, Any]:
+    """Store a login the human ALREADY keeps in a dotenv file (KEY=value lines)
+    as an umbra entry, without you seeing it. umbra reads only `password_key`
+    (and `username_key`) inside the server; you get back key NAMES only. Then
+    log in with fill_secret(tab, <name>).
+
+    Login in a .env file? Use this. Never read/cat/grep the file, and never
+    type its values via evaluate, set_fields, a script or the devtools port.
+
+    `store` for a bare name: keyring → `kr:NAME` (no unlock needed — default),
+    infisical → `inf:NAME`, local → local vault (only while the human has it
+    unlocked). A `kr:`/`inf:` prefix on `name` picks the store itself.
+    Refuses to overwrite an existing entry unless replace=True, and refuses
+    (naming the key) when a key is missing or empty.
+
+    Ex: secret_import_env('ccc-main', ['https://dev.example.com'],
+            '~/dev/.env.test-users', 'CCC_MAIN_PASSWORD', username_key='CCC_MAIN_EMAIL')
+        → {"ok":true,"name":"kr:ccc-main","origins":["https://dev.example.com"],
+           "keys":{"password":"CCC_MAIN_PASSWORD","username":"CCC_MAIN_EMAIL"}}"""
+    full = vault_store.qualify(name, store)
+    try:
+        norm = [vault_store.normalize_origin(o) for o in origins]
+    except ValueError as e:
+        return {"ok": False, "why": str(e)}
+    if not norm:
+        return {"ok": False, "why": "pass at least one origin (where this login is used)"}
+    keys = {"password": password_key, **({"username": username_key} if username_key else {})}
+    path = Path(env_file).expanduser()
+
+    def _import() -> str:
+        entry = vault_store.entry_from_env(path, norm, password_key, username_key)
+        vault_store.put(full, entry, replace=replace)
+        return entry.password
+
+    try:
+        password = await asyncio.to_thread(_import)
+    except vault_store.VaultError as e:
+        vault_guard.audit(entry=full, result="import-refused", why=str(e))
+        return {"ok": False, "why": str(e)}
+    vault_guard.register(password, full)
+    vault_guard.audit(entry=full, result="imported", origins=norm, env_file=str(path),
+                      keys=keys, replaced=replace)
+    return {"ok": True, "name": full, "origins": norm, "keys": keys}
 
 
 # ═════════════════════════════════════════════════════════════════════════

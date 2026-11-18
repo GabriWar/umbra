@@ -105,6 +105,31 @@ def _import_bw(a: argparse.Namespace) -> None:
     print(f"imported {len(entries)} logins. Delete the export now: shred -u {a.file}")
 
 
+def _import_env(a: argparse.Namespace) -> None:
+    if not a.origin:
+        sys.exit("pass at least one --origin (e.g. --origin https://github.com)")
+    try:
+        origins = [store.normalize_origin(o) for o in a.origin]
+        entry = store.entry_from_env(Path(a.env_file).expanduser(), origins,
+                                     a.password_key, a.user_key)
+    except (ValueError, store.VaultError) as e:
+        sys.exit(str(e))
+    name = store.qualify(a.name, a.store)
+    try:
+        if name.startswith(("kr:", "inf:", "bw:")):
+            store.put(name, entry, replace=a.replace)
+        else:
+            v = _open_local(create=True)
+            if not a.replace and name in v.entries():
+                sys.exit(f"{name} already exists (pass --replace)")
+            entry.name = name
+            v.put(entry)
+    except store.VaultError as e:
+        sys.exit(str(e))
+    used = f"password from {a.password_key}" + (f", username from {a.user_key}" if a.user_key else "")
+    print(f"saved as {name} ({used})")
+
+
 def _audit(a: argparse.Namespace) -> None:
     p = guard.audit_path()
     if not p.exists():
@@ -141,6 +166,16 @@ def main(argv: list[str]) -> int:
     p = sub.add_parser("import-bitwarden", help="copy logins from a plain Bitwarden JSON export")
     p.add_argument("file")
     p.set_defaults(fn=_import_bw)
+
+    p = sub.add_parser("import-env", help="store a login from a dotenv file's keys (values never printed)")
+    p.add_argument("name")
+    p.add_argument("--env-file", required=True, help="dotenv file with KEY=value lines")
+    p.add_argument("--password-key", required=True, help="key holding the password")
+    p.add_argument("--user-key", help="key holding the username / email")
+    p.add_argument("--origin", action="append", help="allowed origin; repeat; https://*.x.com for subdomains")
+    p.add_argument("--store", choices=("keyring", "local", "infisical"), default="keyring")
+    p.add_argument("--replace", action="store_true", help="overwrite an existing entry")
+    p.set_defaults(fn=_import_env)
 
     p = sub.add_parser("audit", help="last fill attempts")
     p.add_argument("-n", type=int, default=20)

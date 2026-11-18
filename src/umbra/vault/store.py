@@ -449,11 +449,30 @@ def create(name: str, origins: list[str], username: str, length: int,
             raise VaultError("rbw not installed (`sudo pacman -S rbw`, then `rbw login`)")
         return bw_generate(name[3:], origins, username, length, symbols)
     password = generate_password(length, symbols)
-    entry = Entry(name=name, origins=origins, username=username, password=password)
+    put(name, Entry(name=name, origins=origins, username=username, password=password))
+    return password
+
+
+def qualify(name: str, store: str) -> str:
+    """Bare name + store ('keyring' / 'infisical' / 'local') → entry name.
+    A name that already has a kr:/inf:/bw: prefix keeps it."""
+    if name.startswith(("kr:", "inf:", "bw:")):
+        return name
+    return {"keyring": "kr:", "infisical": "inf:", "local": ""}[store] + name
+
+
+def put(name: str, entry: Entry, *, replace: bool = False) -> None:
+    """Store `entry` under `name` (prefix picks the store). Refuses to overwrite
+    an existing entry unless `replace`. Local = the server's unlocked vault."""
+    if any(part.startswith("-") for part in name.split(":", 1)[-1].split("::")):
+        raise VaultError("entry names may not start with '-'")
+    entry.name = name
+    if name.startswith("bw:"):
+        raise VaultError("bw: entries are added in Bitwarden itself; use a kr: or inf: name")
     if name.startswith("kr:"):
         if not keyring_available():
             raise VaultError("secret-tool not installed (libsecret)")
-        if exists(name):
+        if not replace and exists(name):
             raise VaultError(f"{name} already exists")
         entry.name = name[3:]
         keyring_put(entry)
@@ -461,7 +480,7 @@ def create(name: str, origins: list[str], username: str, length: int,
         if not infisical_available():
             raise VaultError("infisical CLI not installed")
         _inf_key(name[4:])
-        if exists(name):
+        if not replace and exists(name):
             raise VaultError(f"{name} already exists")
         infisical_put(entry)
     else:
@@ -469,10 +488,56 @@ def create(name: str, origins: list[str], username: str, length: int,
         if v is None:
             raise VaultError("local vault is locked — use a kr:/inf:/bw: name, or ask the "
                              "human to run `python -m umbra vault unlock`")
-        if name in v.entries():
+        if not replace and name in v.entries():
             raise VaultError(f"{name} already exists")
         v.put(entry)
-    return password
+
+
+# ─────────────────────────────── dotenv ────────────────────────────────
+
+_ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=(.*)$")
+
+
+def _env_value(raw: str) -> str | None:
+    """dotenv value: 'single' literal, "double" with \\-escapes, or bare with a
+    ` #comment` dropped. None for an unterminated quote (multi-line)."""
+    raw = raw.strip()
+    if raw[:1] == "'":
+        end = raw.find("'", 1)
+        return raw[1:end] if end > 0 else None
+    if raw[:1] == '"':
+        m = re.match(r'"((?:[^"\\]|\\.)*)"', raw)
+        if not m:
+            return None
+        return re.sub(r"\\(.)", lambda c: {"n": "\n", "t": "\t"}.get(c[1], c[1]), m[1])
+    return re.split(r"\s+#", raw, maxsplit=1)[0]
+
+
+def entry_from_env(path: Path, origins: list[str], password_key: str,
+                   username_key: str | None = None) -> Entry:
+    """Entry built from two keys of a dotenv file. Only lines assigning those
+    keys are parsed (last one wins); errors name keys, never values."""
+    keys = [k for k in (password_key, username_key) if k]
+    vals: dict[str, str | None] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise VaultError(f"cannot read {path}: {e.strerror}") from None
+    except UnicodeDecodeError:
+        raise VaultError(f"{path} is not UTF-8 text") from None
+    for line in text.splitlines():
+        m = _ENV_LINE.match(line)
+        if m and m[1] in keys:
+            vals[m[1]] = _env_value(m[2])
+    for k in keys:
+        if k not in vals:
+            raise VaultError(f"{k} not found in {path}")
+        if vals[k] is None:
+            raise VaultError(f"{k} in {path} has an unterminated quote")
+        if not vals[k]:
+            raise VaultError(f"{k} is empty in {path}")
+    return Entry(name="", origins=origins, password=vals[password_key] or "",
+                 username=(vals[username_key] or "") if username_key else "")
 
 # ─────────────────────────────── resolve ───────────────────────────────
 

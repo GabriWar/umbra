@@ -4,7 +4,7 @@
     python -m umbra --status
     python -m umbra --uninstall
     python -m umbra server [server-args ...]
-    python -m umbra vault {add,list,rm,unlock,lock,import-bitwarden,audit}
+    python -m umbra vault {add,list,rm,unlock,lock,import-bitwarden,import-env,audit}
 
 `--setup` is the friendly alias for `umbra-cloak-setup` — fetches the
 CloakBrowser patched chromium build, sha256-verifies it, caches it under
