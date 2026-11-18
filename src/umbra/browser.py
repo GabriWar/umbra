@@ -61,6 +61,30 @@ _nodriver_log = logging.getLogger("nodriver.core.connection")
 _nodriver_log.addFilter(_NodriverSchemaFilter())
 
 
+def _windows_exe_version(path: str) -> str | None:
+    """File version of a Windows exe (e.g. '146.0.7680.177'), without running it."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        ver = ctypes.WinDLL("version")
+        size = ver.GetFileVersionInfoSizeW(path, None)
+        if not size:
+            return None
+        buf = ctypes.create_string_buffer(size)
+        if not ver.GetFileVersionInfoW(path, 0, size, buf):
+            return None
+        ptr, length = ctypes.c_void_p(), wintypes.UINT()
+        if not ver.VerQueryValueW(buf, "\\", ctypes.byref(ptr), ctypes.byref(length)):
+            return None
+        # VS_FIXEDFILEINFO: dwFileVersionMS / dwFileVersionLS are the 3rd and 4th DWORDs.
+        info = ctypes.cast(ptr, ctypes.POINTER(wintypes.DWORD * 4)).contents
+        ms, ls = info[2], info[3]
+        return f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
 def _detect_chrome_version(chrome_path: str | None) -> str:
     """Run `chrome --version` to get the actual installed Chromium version.
 
@@ -72,6 +96,14 @@ def _detect_chrome_version(chrome_path: str | None) -> str:
     "this is actually 145".
     """
     fallback = "146.0.7339.16"
+    if os.name == "nt":
+        # On Windows `chrome.exe --version` prints nothing and opens a visible
+        # browser window instead, so read the version from the exe's resource.
+        version = _windows_exe_version(chrome_path) if chrome_path else None
+        if version:
+            return version
+        log.warning("could not detect Chrome version, falling back to %s", fallback)
+        return fallback
     candidates = [chrome_path] if chrome_path else [
         "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
         "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser",
