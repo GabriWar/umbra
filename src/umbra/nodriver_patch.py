@@ -42,6 +42,7 @@ _APPLIED = False
 _FLAG_TX = "_umbra_patched_tx_call"
 _FLAG_LISTENER = "_umbra_patched_listener"
 _FLAG_COOKIE = "_umbra_patched_cookie_from_json"
+_FLAG_TAB_GET = "_umbra_patched_tab_get"
 
 
 def apply() -> bool:
@@ -57,6 +58,7 @@ def apply() -> bool:
 
     try:
         import nodriver.core.connection as conn_mod
+        import nodriver.core.tab as tab_mod
         from nodriver.cdp import network as cdp_network
     except ImportError:
         log.warning("nodriver not importable — patches skipped")
@@ -66,6 +68,7 @@ def apply() -> bool:
         "transaction_call": _safe_apply(_patch_transaction_call, conn_mod),
         "listener": _safe_apply(_patch_listener, conn_mod),
         "cookie_from_json": _safe_apply(_patch_cookie_from_json, cdp_network),
+        "tab_get_keeps_session": _safe_apply(_patch_tab_get, tab_mod, conn_mod),
     }
     all_ok = all(results.values())
     if all_ok:
@@ -101,6 +104,9 @@ def _patch_transaction_call(conn_mod: Any) -> bool:
     Transaction = conn_mod.Transaction
     if getattr(Transaction, _FLAG_TX, False):
         return True
+    if not _legacy_connection(conn_mod):
+        log.debug("nodriver >=0.50 connection layer — transaction patch not needed")
+        return True
     ProtocolException = conn_mod.ProtocolException
 
     def __call__(self: Any, **response: dict) -> None:
@@ -121,6 +127,21 @@ def _patch_transaction_call(conn_mod: Any) -> bool:
     return True
 
 
+def _legacy_connection(conn_mod: Any) -> bool:
+    """True on nodriver <=0.48, where ``Transaction`` is the awaited Future.
+
+    nodriver 0.50 rewrote the connection layer: the listener only resolves a
+    plain future per id (``Connection._mapper``) and ``send()`` parses the
+    response itself, so a parser error reaches the caller and can't kill the
+    listener. Our listener replacement reads the old ``mapper``/``_lock``/
+    ``websocket`` attributes, so installing it there leaves every CDP call
+    unanswered — the browser starts but the first ``spawn`` never returns.
+    """
+    import asyncio
+
+    return isinstance(conn_mod.Transaction, type) and issubclass(conn_mod.Transaction, asyncio.Future)
+
+
 def _patch_listener(conn_mod: Any) -> bool:
     """Wrap ``tx(**message)`` so a parser bug can't kill the listener.
 
@@ -133,6 +154,9 @@ def _patch_listener(conn_mod: Any) -> bool:
     """
     Connection = conn_mod.Connection
     if getattr(Connection, _FLAG_LISTENER, False):
+        return True
+    if not _legacy_connection(conn_mod):
+        log.debug("nodriver >=0.50 connection layer — listener patch not needed")
         return True
 
     import asyncio
@@ -241,9 +265,18 @@ def _patch_cookie_from_json(cdp_network: Any) -> bool:
     CookieSourceScheme = cdp_network.CookieSourceScheme
     CookieSameSite = cdp_network.CookieSameSite
     CookiePartitionKey = cdp_network.CookiePartitionKey
+    # nodriver 0.50 dropped the field along with Chrome; passing it there
+    # would TypeError on every cookie.
+    import dataclasses
+
+    has_same_party = any(f.name == "same_party" for f in dataclasses.fields(Cookie))
 
     def from_json(cls, json: dict) -> Any:
+        extra = {}
+        if has_same_party:
+            extra["same_party"] = bool(json["sameParty"]) if json.get("sameParty") is not None else False
         return cls(
+            **extra,
             name=str(json["name"]),
             value=str(json["value"]),
             domain=str(json["domain"]),
@@ -255,7 +288,6 @@ def _patch_cookie_from_json(cdp_network: Any) -> bool:
             priority=CookiePriority.from_json(json["priority"])
             if json.get("priority") is not None
             else CookiePriority.MEDIUM,
-            same_party=bool(json["sameParty"]) if json.get("sameParty") is not None else False,
             source_scheme=CookieSourceScheme.from_json(json["sourceScheme"])
             if json.get("sourceScheme") is not None
             else CookieSourceScheme.UNSET,
@@ -274,4 +306,39 @@ def _patch_cookie_from_json(cdp_network: Any) -> bool:
 
     type.__setattr__(Cookie, "from_json", classmethod(from_json))
     type.__setattr__(Cookie, _FLAG_COOKIE, True)
+    return True
+
+
+def _patch_tab_get(tab_mod: Any, conn_mod: Any) -> bool:
+    """Stop ``Tab.get`` from opening a fresh CDP session on every navigation.
+
+    nodriver 0.50's ``Tab.get`` ends with an unconditional ``self.attach()``,
+    which sends ``Target.attachToTarget`` again and swaps in a new session
+    id. Everything umbra enabled on the first session — Fetch interception,
+    Network/Runtime buffers — stays on the old one: Chrome keeps pausing
+    requests there while ``tab.send`` answers on the new session, so
+    ``Fetch.continueRequest`` fails with "Fetch domain is not enabled" and
+    the page hangs half-loaded. Attach only when the tab isn't attached.
+    """
+    Tab = tab_mod.Tab
+    if getattr(Tab, _FLAG_TAB_GET, False):
+        return True
+    if _legacy_connection(conn_mod):
+        return True  # 0.48's Tab.get never re-attached
+    cdp = tab_mod.cdp
+
+    async def get(self: Any, url: str = "about:blank", new_tab: bool = False, new_window: bool = False) -> Any:
+        if not self.browser:
+            raise AttributeError("this page/tab has no browser attribute, so you can't use get()")
+        if new_window and not new_tab:
+            new_tab = True
+        if new_tab:
+            return await self.browser.get(url, new_tab, new_window)
+        await self.send(cdp.page.navigate(url))
+        if not self.attached:
+            await self.attach()
+        return self
+
+    type.__setattr__(Tab, "get", get)
+    type.__setattr__(Tab, _FLAG_TAB_GET, True)
     return True

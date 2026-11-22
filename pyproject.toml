@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP :: Browsers",
 ]
 dependencies = [
-    "nodriver>=0.47.0",
+    "nodriver==0.50.99",
     "fastmcp>=2.0",
     "cryptography>=42", # encrypted session save/load (umbra.session)
     "websockets>=13", # handoff remote-view server (also transitive via nodriver)
