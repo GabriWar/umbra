@@ -363,6 +363,9 @@ class StealthOptions:
     # Short names from umbra.extensions.KNOWN ('ublock-lite'). Loading one
     # forces a visible window — Chrome ignores --load-extension in headless.
     extensions: list[str] = field(default_factory=list)
+    # Headed only: group every tab under this name in the tab strip (via a
+    # generated extension). Ignored headless — there's no tab strip to show.
+    tab_group: str | None = None
     chrome_path: str | None = None  # nodriver auto-detects if None
     extra_args: list[str] = field(default_factory=list)
     window_size: tuple[int, int] = (1920, 1080)
@@ -658,14 +661,17 @@ class StealthBrowser:
             flags.append("--disable-dev-shm-usage")
             log.info("Container/root detected — sandbox disabled")
 
-        if opts.extensions:
-            from umbra.extensions import ensure as _ensure_ext
+        headed = not opts.headless or bool(opts.extensions)  # extensions force a window
+        if opts.extensions or (opts.tab_group and headed):
+            from umbra.extensions import ensure as _ensure_ext, tab_group_dir
             paths = [str(_ensure_ext(n)) for n in opts.extensions]
+            if opts.tab_group and headed:
+                paths.append(str(tab_group_dir(opts.tab_group)))
             flags.append("--load-extension=" + ",".join(paths))
             # Real Chrome ships this on; the base flag set turned it off, and
             # a blocker that never runs is worse than none.
             flags[:] = [f for f in flags if f != "--disable-extensions"]
-            if opts.headless:
+            if opts.extensions and opts.headless:
                 log.warning("extensions %s requested — headless disabled, Chrome "
                             "drops --load-extension without a window",
                             opts.extensions)

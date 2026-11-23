@@ -64,6 +64,11 @@ img { display: block; cursor: crosshair; max-width: 100vw; image-rendering: pixe
 .cursor { position: absolute; width: 12px; height: 12px; border: 2px solid #ff3333; border-radius: 50%; pointer-events: none; transform: translate(-50%, -50%); }
 #status { position: fixed; bottom: 8px; right: 12px; font-size: 11px; color: #666; }
 #kbd-btn { background: #333; }
+#who { font-weight: 700; color: #2ecc71; font-size: 14px; }
+#tabs { padding: 6px 14px; background: #141414; border-bottom: 1px solid #2a2a2a; display: none; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 12px; }
+#tabs .grp { color: #888; font-weight: 700; margin-left: 8px; }
+#tabs button { background: #262626; color: #ccc; padding: 4px 8px; font-weight: 400; font-size: 12px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#tabs button.on { background: #2ecc71; color: #000; }
 /* Phone keyboard target: must stay focusable (no display:none) to open the
    soft keyboard; 16px stops iOS zooming in on focus. */
 #kbd { position: fixed; bottom: 0; left: 0; width: 1px; height: 1px; opacity: 0; font-size: 16px; border: 0; padding: 0; }
@@ -73,11 +78,14 @@ img { display: block; cursor: crosshair; max-width: 100vw; image-rendering: pixe
 </head>
 <body>
 <div id="bar">
+    <span id="who"></span>
     <span id="reason">handoff active - interact with the page below</span>
     <span id="kbd-hint">click in the viewport, then keys forward</span>
     <button id="kbd-btn" title="open keyboard">&#9000; KEYBOARD</button>
+    <button id="paste-btn" title="paste your clipboard into the page">PASTE</button>
     <button id="done">I'M DONE</button>
 </div>
+<div id="tabs"></div>
 <input id="kbd" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="keyboard input"/>
 <div id="viewport" tabindex="0">
     <img id="screen" alt="loading..."/>
@@ -102,6 +110,7 @@ ws.onmessage = e => {
     const m = JSON.parse(e.data);
     if (m.type === 'frame') {
         img.src = 'data:image/jpeg;base64,' + m.b64;
+        document.getElementById('who').textContent = m.group ? m.group + ' \u00b7 ' + m.id : '';
         status.textContent = m.url || 'connected';
         status.className = 'ok';
     } else if (m.type === 'paused') {
@@ -116,6 +125,8 @@ ws.onmessage = e => {
         setControl(false);
     } else if (m.type === 'control') {
         setControl(m.active);
+    } else if (m.type === 'tabs') {
+        renderTabs(m.tabs, m.pinned);
     }
 };
 let viewOnly = false, watchMode = false, inControl = false;
@@ -126,6 +137,35 @@ function setControl(active) {
     document.getElementById('kbd-hint').textContent = active
         ? 'agent paused - you are driving' : 'read-only live view';
     img.style.cursor = active ? 'crosshair' : 'default';
+}
+
+// Tab picker: every agent's tabs, grouped by the name the agent gave its
+// browser. Click one to pin the view to it; FOLLOW AGENT goes back.
+// textContent only: titles come from arbitrary web pages.
+function renderTabs(tabs, pinned) {
+    const box = document.getElementById('tabs');
+    box.replaceChildren();
+    box.style.display = tabs.length ? 'flex' : 'none';
+    const btn = (label, on, id, title) => {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.title = title || label;
+        if (on) b.className = 'on';
+        b.onclick = () => rawSend(JSON.stringify({type: 'pin', id}));
+        box.appendChild(b);
+    };
+    btn('FOLLOW AGENT', !pinned, null, 'show whichever tab the agent uses');
+    let group = null;
+    for (const t of tabs) {
+        if (t.group !== group) {
+            group = t.group;
+            const g = document.createElement('span');
+            g.className = 'grp';
+            g.textContent = group;
+            box.appendChild(g);
+        }
+        btn(t.id + ' ' + (t.title || t.url || ''), pinned === t.id, t.id, t.url);
+    }
 }
 
 const rawSend = ws.send.bind(ws);
@@ -167,6 +207,9 @@ img.addEventListener('dblclick', e => {
     if (ws.readyState === 1) ws.send(JSON.stringify({type: 'dblclick', x: c.x, y: c.y}));
 });
 viewport.addEventListener('keydown', e => {
+    // Ctrl/Cmd+V: let the browser fire 'paste' with OUR clipboard; forwarding
+    // the keys would paste the remote browser's own (empty) clipboard.
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') return;
     e.preventDefault();
     if (ws.readyState !== 1) return;
     ws.send(JSON.stringify({type: 'key', key: e.key, code: e.code,
@@ -207,6 +250,23 @@ kbd.addEventListener('keydown', e => {
     if (e.key === 'Enter') kbdReset();
 });
 document.getElementById('kbd-btn').onclick = () => { kbdReset(); kbd.focus(); };
+
+// Paste: send the viewer's clipboard text as one insert into the focused field.
+function sendText(text) {
+    if (text && ws.readyState === 1) ws.send(JSON.stringify({type: 'text', text}));
+}
+for (const el of [viewport, kbd]) el.addEventListener('paste', e => {
+    e.preventDefault();
+    sendText(e.clipboardData.getData('text/plain'));
+});
+document.getElementById('paste-btn').onclick = async () => {
+    try {
+        sendText(await navigator.clipboard.readText());
+    } catch (err) {
+        status.textContent = 'clipboard blocked (' + err + ') - use ctrl+v / long-press paste';
+        status.className = 'dead';
+    }
+};
 
 document.getElementById('done').onclick = async () => {
     if (watchMode) {
@@ -333,17 +393,22 @@ class HandoffSession:
                  tunnel: bool = False, *, view_only: bool = False,
                  get_tab: Callable[[], Any] | None = None,
                  paused: Callable[[Any], Awaitable[str | None]] | None = None,
-                 on_control: Callable[[bool], None] | None = None):
+                 on_control: Callable[[bool], None] | None = None,
+                 tabs: Callable[[], list[dict[str, Any]]] | None = None):
         """view_only: stream frames, ignore input (watch mode) until the viewer
         takes control; on_control(True/False) is told when they take/give back.
         get_tab: called per frame to pick the tab to show (follow mode).
-        paused: per frame; a non-empty answer replaces the frame with that text."""
+        paused: per frame; a non-empty answer replaces the frame with that text.
+        tabs: lists every tab as {id, group, title, url, tab}; enables the
+        viewer's tab picker (pin one tab, or follow get_tab again)."""
         self.tab = tab
         self.view_only = view_only
         self.control = False
         self._get_tab = get_tab or (lambda: self.tab)
         self._paused = paused
         self._on_control = on_control
+        self._tabs = tabs
+        self._pin: str | None = None
         self._clients: set[Any] = set()
         self.reason = reason
         self.fps = fps
@@ -505,6 +570,9 @@ class HandoffSession:
                     data = json.loads(msg)
                 except (json.JSONDecodeError, TypeError):
                     continue
+                if data.get("type") == "pin" and self._tabs:
+                    self._pin = data.get("id") or None
+                    continue
                 if self.view_only:
                     kind = data.get("type")
                     if kind in ("take", "give"):
@@ -538,14 +606,30 @@ class HandoffSession:
             with suppress(Exception):
                 await ws.send(json.dumps({"type": "control", "active": active}))
 
+    def _current_tab(self, entries: list[dict[str, Any]]) -> Any:
+        """The pinned tab while it exists, else whatever get_tab picks."""
+        if self._pin:
+            hit = next((e["tab"] for e in entries if e.get("id") == self._pin), None)
+            if hit is not None:
+                return hit
+            self._pin = None  # pinned tab closed: back to following
+        return self._get_tab()
+
     async def _screenshot_loop(self, websocket: Any) -> None:
         """Stream JPEG screenshots over the websocket at `self.fps` Hz."""
         import nodriver as uc
         cdp = uc.cdp
         interval = 1.0 / max(self.fps, 1)
+        last_tabs = ""
         while not self.done_event.is_set():
             try:
-                tab = self._get_tab()
+                entries = self._tabs() if self._tabs else []
+                tab = self._current_tab(entries)
+                listing = json.dumps({"type": "tabs", "pinned": self._pin, "tabs": [
+                    {k: e.get(k) for k in ("id", "group", "title", "url")} for e in entries]})
+                if listing != last_tabs:
+                    await websocket.send(listing)
+                    last_tabs = listing
                 why = "waiting for the agent to open a tab" if tab is None else (
                     await self._paused(tab) if self._paused else None)
                 if why:
@@ -559,7 +643,10 @@ class HandoffSession:
                 if isinstance(shot, bytes):
                     shot = base64.b64encode(shot).decode("ascii")
                 url = str(getattr(getattr(tab, "target", None), "url", "") or "")
-                await websocket.send(json.dumps({"type": "frame", "b64": shot, "url": url}))
+                cur = next((e for e in entries if e.get("tab") is tab), None)
+                await websocket.send(json.dumps({
+                    "type": "frame", "b64": shot, "url": url,
+                    "group": cur and cur.get("group"), "id": cur and cur.get("id")}))
             except websockets.exceptions.ConnectionClosed:
                 return
             except Exception as e:  # noqa: BLE001
@@ -570,7 +657,7 @@ class HandoffSession:
         """Translate a user input event to a CDP Input.* call."""
         import nodriver as uc
         cdp = uc.cdp
-        tab = self._get_tab()
+        tab = self._current_tab(self._tabs() if self._tabs else [])
         if tab is None:
             return
         t = data.get("type")
@@ -613,6 +700,8 @@ class HandoffSession:
                 type_="keyUp", key=key, code=code, modifiers=mods,
                 windows_virtual_key_code=vk or None,
             ))
+        elif t == "text":
+            await tab.send(cdp.input_.insert_text(text=str(data.get("text", ""))))
         elif t == "scroll":
             await tab.send(cdp.input_.dispatch_mouse_event(
                 type_="mouseWheel", x=x, y=y,

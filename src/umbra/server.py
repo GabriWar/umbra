@@ -534,6 +534,14 @@ async def spawn(
     For same-identity new pages prefer `navigate` (cheaper). stealth_mode='minimal'
     (default)=mimics vanilla Chrome, 'full'=adds anti-tracking noise.
 
+    NAME YOUR BROWSER: pass a browser_id that says who you are and what you're
+    doing — the human sees it as the tab-group title in a visible Chrome and
+    as the label on the watch_start live view, and uses it to tell agents
+    apart. Short kebab-case, task + site: 'hn-frontpage-digest',
+    'github-pr-review', 'flight-prices-lis-nyc', 'invoice-download-aws'. Not
+    'default', 'b1', 'test', 'browser', or your agent/model name alone. Same
+    job → reuse the same id (same cookies, same group); new job → new id.
+
     Proxy: pass `proxy='http://user:pass@host:port'` for one-off, OR set
     `use_proxy_pool=True` (after `proxy_pool_load`) to pick from the pool —
     optionally filter by `proxy_country='US'` / `proxy_tag='residential'`.
@@ -584,6 +592,7 @@ async def spawn(
         profile_directory=profile_directory,
         extensions=list(extensions or []),
         extra_args=list(extra_args or []),
+        tab_group=browser_id or "default",
     )
     bid, browser = await _get_or_create_browser(browser_id, opts)
     # Off the critical path: a weekly look for newer cloak/extension builds.
@@ -2504,6 +2513,17 @@ def _followed_tab() -> Any:
     return max(_state["tabs"].values(), key=lambda e: e.get("last_used_at", 0))["tab"]
 
 
+def _watch_tabs() -> list[dict[str, Any]]:
+    """Every open tab for the watch page's picker, grouped by browser_id."""
+    out = []
+    for tid, e in sorted(_state["tabs"].items(), key=lambda kv: (kv[1]["browser_id"], kv[0])):
+        target = getattr(e["tab"], "target", None)
+        out.append({"id": tid, "group": e["browser_id"], "tab": e["tab"],
+                    "title": str(getattr(target, "title", "") or "")[:60],
+                    "url": str(getattr(target, "url", "") or "")})
+    return out
+
+
 async def _watch_paused(tab: Any) -> str | None:
     """No frames while a filled password is on a page of this tab's browser:
     the agent knows the watch URL too."""
@@ -2537,7 +2557,7 @@ async def watch_start(tab_id: str | None = None, tunnel: bool = True,
         _get_tab(tab_id) if tab_id else None, reason="watching umbra",
         fps=fps, tunnel=tunnel, view_only=True,
         get_tab=None if tab_id else _followed_tab, paused=_watch_paused,
-        on_control=_on_human_control)
+        on_control=_on_human_control, tabs=_watch_tabs)
     url = await session.start()
     _state["watch"] = session
     return _compact({"url": url, "following": tab_id or "last used tab",

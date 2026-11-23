@@ -142,3 +142,58 @@ def ensure(name: str, *, force: bool = False) -> Path:
     tmp.rename(target)
     log.info("extension %s unpacked to %s", name, target)
     return target
+
+
+# ── Tab group: put every tab of a headed browser into one named group ──────
+# Each browser_id is its own Chrome process, so "this window's tabs" are
+# exactly one agent's tabs. CDP can't create tab groups; an extension's
+# chrome.tabGroups can. Invisible to pages: no content scripts, no
+# web-accessible resources, no externally_connectable — the only ways a page
+# can probe for an extension. Its name is random per launch, so even
+# chrome://extensions shows nothing umbra-shaped.
+
+_TAB_GROUP_COLORS = ("blue", "red", "yellow", "green", "pink", "purple",
+                     "cyan", "orange", "grey")
+
+_TAB_GROUP_JS = """const NAME = __NAME__, COLOR = __COLOR__;
+let chain = Promise.resolve();
+const sync = () => { chain = chain.then(run, run); };
+async function run() {
+  const loose = await chrome.tabs.query({windowType: 'normal',
+    groupId: chrome.tabGroups.TAB_GROUP_ID_NONE});
+  const byWin = new Map();
+  for (const t of loose) if (!t.pinned) byWin.set(t.windowId, [...(byWin.get(t.windowId) || []), t.id]);
+  for (const [windowId, tabIds] of byWin) {
+    const [g] = await chrome.tabGroups.query({windowId, title: NAME});
+    if (g) { await chrome.tabs.group({groupId: g.id, tabIds}); continue; }
+    const id = await chrome.tabs.group({tabIds, createProperties: {windowId}});
+    await chrome.tabGroups.update(id, {title: NAME, color: COLOR});
+  }
+}
+chrome.tabs.onCreated.addListener(sync);
+chrome.tabs.onAttached.addListener(sync);
+chrome.runtime.onStartup.addListener(sync);
+sync();
+"""
+
+
+def tab_group_dir(name: str) -> Path:
+    """Unpacked extension that groups every tab under `name` (same name →
+    same color every run)."""
+    import hashlib
+    import json
+    import secrets
+    safe = hashlib.sha256(name.encode()).hexdigest()[:16]
+    target = cache_root() / "tab-group" / safe
+    color = _TAB_GROUP_COLORS[int(safe, 16) % len(_TAB_GROUP_COLORS)]
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "manifest.json").write_text(json.dumps({
+        "manifest_version": 3, "name": secrets.token_hex(4),
+        "version": f"1.{secrets.randbelow(90) + 10}",
+        "permissions": ["tabGroups"],
+        "background": {"service_worker": "bg.js"},
+    }))
+    (target / "bg.js").write_text(_TAB_GROUP_JS
+                                  .replace("__NAME__", json.dumps(name))
+                                  .replace("__COLOR__", json.dumps(color)))
+    return target
