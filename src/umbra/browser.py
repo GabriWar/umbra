@@ -29,8 +29,15 @@ from typing import Any, AsyncIterator
 import nodriver as uc
 
 from umbra.nodriver_patch import apply as _apply_nodriver_patches
+from umbra.orphans import install_pdeathsig as _install_pdeathsig
 from umbra.stealth.blocklist import is_blocked
 from umbra.stealth.inject import install as install_stealth
+
+
+# Chrome dies with this server however it ends (SIGKILL, a closed SSH session): no
+# orphan left burning CPU. Once, before any per-browser wrapper (the LD_PRELOAD shim's
+# saves and restores the spawner around itself).
+_install_pdeathsig()
 
 # Patch nodriver before any Connection or Cookie object is created.
 # Fixes: (1) listener task dying on parser exceptions, (2) Cookie.from_json

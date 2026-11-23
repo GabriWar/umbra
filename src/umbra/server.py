@@ -3440,6 +3440,65 @@ def _kill_orphan_chromes(*, include_self: bool = False) -> dict[str, Any]:
     return {"killed_pids": killed_pids, "removed_dirs": removed_dirs}
 
 
+def _sweep_abandoned() -> dict[str, Any]:
+    """Kill Chrome trees whose umbra server is gone (adopted by init / systemd), then
+    remove their profile dirs. Never a browser with a live parent server, idle or not."""
+    from umbra.orphans import abandoned
+
+    try:
+        ps = subprocess.run(["ps", "-eo", "pid=,ppid=,comm=,args="], capture_output=True,
+                            text=True, timeout=5, check=False)
+    except Exception:  # noqa: BLE001
+        return {"killed_pids": [], "removed_dirs": []}
+    parent: dict[int, int] = {}
+    comm: dict[int, str] = {}
+    data_dir: dict[int, str] = {}
+    for line in ps.stdout.splitlines() if ps.returncode == 0 else []:
+        parts = line.split(None, 3)
+        if len(parts) < 3:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        parent[pid], comm[pid] = ppid, parts[2]
+        for tok in (parts[3] if len(parts) > 3 else "").split():
+            if tok.startswith(f"--user-data-dir={_UC_PREFIX}"):
+                data_dir[pid] = tok.split("=", 1)[1]
+                break
+    killed = abandoned(parent, data_dir, comm)
+    for pid in killed:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGKILL)
+    removed: list[str] = []
+    if killed:
+        time.sleep(0.5)
+        live = {d for p, d in data_dir.items() if p not in killed}
+        for udir in {data_dir[p] for p in killed} - live:
+            shutil.rmtree(udir, ignore_errors=True)
+            removed.append(udir)
+    return {"killed_pids": killed, "removed_dirs": removed}
+
+
+def _start_abandoned_sweeper(interval_seconds: float) -> None:
+    """Every `interval_seconds`, in a daemon thread (stdio servers have no GC loop)."""
+    import threading
+
+    log = logging.getLogger("umbra.orphans")
+
+    def loop() -> None:
+        while True:
+            time.sleep(interval_seconds)
+            try:
+                res = _sweep_abandoned()
+                if res["killed_pids"]:
+                    log.info("abandoned chrome sweep: %s", res)
+            except Exception as e:  # noqa: BLE001
+                log.warning("abandoned chrome sweep error: %s", e)
+
+    threading.Thread(target=loop, name="umbra-orphan-sweep", daemon=True).start()
+
+
 async def _idle_gc_loop(idle_seconds: float, interval_seconds: float) -> None:
     """Background task: sweep idle tabs/browsers every `interval_seconds`."""
     log = logging.getLogger("umbra.gc")
@@ -3758,7 +3817,8 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop) -> None:
         # Give shutdown ~3s to drain, then stop the loop
         loop.call_later(3.0, loop.stop)
 
-    for sig in (signal.SIGTERM, signal.SIGINT):
+    # SIGHUP: the SSH session (or terminal) that ran the server closed.
+    for sig in [signal.SIGTERM, signal.SIGINT] + ([signal.SIGHUP] if hasattr(signal, "SIGHUP") else []):
         try:
             loop.add_signal_handler(sig, _handler, sig)
         except NotImplementedError:
@@ -3820,6 +3880,7 @@ def main() -> None:
                 log.info("startup orphan sweep: %s", res)
         except Exception as e:  # noqa: BLE001
             log.warning("startup orphan sweep failed: %s", e)
+        _start_abandoned_sweeper(max(args.gc_interval, 10.0))
 
     if args.transport == "stdio":
         # stdio is single-client, no auth/REST/uvicorn — keep simple
