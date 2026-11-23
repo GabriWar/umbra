@@ -618,6 +618,9 @@ async def spawn(
             "tags": list(e.tags),
             "health": round(e.health, 3),
         }
+    hint = _updates.umbra_update_hint()
+    if hint:
+        out["umbra_update"] = hint
     return _compact(out)
 
 
@@ -3471,7 +3474,9 @@ async def cleanup_stale(idle_seconds: float = 600.0) -> dict[str, Any]:
 @mcp.tool()
 async def update_status(check_now: bool = False,
                         download: bool = True) -> dict[str, Any]:
-    """Installed vs latest for the cloak build and any cached extensions.
+    """Installed vs latest for umbra itself (git checkout: commits behind
+    upstream, never auto-pulled — pass `how` to the user), the cloak build,
+    and any cached extensions.
 
     A check runs on its own once every UMBRA_UPDATE_EVERY_DAYS (default 7,
     0 disables), in the background after a spawn, and installs newer builds

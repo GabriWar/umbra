@@ -1,4 +1,5 @@
 """Keep the cloak build and the optional extensions current — sensibly.
+Also checks umbra's own git checkout against its upstream (report only).
 
 Both are cached forever once fetched, and neither has a channel that would
 refresh it: the cloak loader only ever resolves what is already on disk, and
@@ -111,6 +112,53 @@ def _ext_names_installed() -> list[str]:
     return [n for n in KNOWN if installed_version(n)]
 
 
+# ── umbra itself ───────────────────────────────────────────────────────────
+# Report only: pulling would swap code under a running server, so the user
+# runs `git pull` and restarts when they choose.
+
+def umbra_repo() -> Path | None:
+    """The git checkout umbra runs from, or None (e.g. a wheel install)."""
+    import subprocess
+    here = Path(__file__).resolve().parent
+    try:
+        out = subprocess.run(["git", "-C", str(here), "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return Path(out.stdout.strip()) if out.returncode == 0 else None
+
+
+def _umbra_check(repo: Path) -> dict[str, Any]:
+    import subprocess
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+
+    def git(*args: str, timeout: float = 10) -> str:
+        r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                           text=True, timeout=timeout, env=env)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip()[:200] or f"git {args[0]} failed")
+        return r.stdout.strip()
+
+    git("fetch", "--quiet", timeout=30)
+    behind = int(git("rev-list", "--count", "HEAD..@{u}"))
+    entry: dict[str, Any] = {"installed": git("rev-parse", "--short", "HEAD"),
+                             "latest": git("rev-parse", "--short", "@{u}"),
+                             "behind": behind}
+    if behind:
+        entry["how"] = f"cd {repo} && git pull, then restart umbra"
+    return entry
+
+
+def umbra_update_hint() -> str | None:
+    """One line for the agent to pass on when the last check found umbra
+    behind its upstream; None otherwise. Reads state only, no network."""
+    u = load_state().get("umbra") or {}
+    if not u.get("behind"):
+        return None
+    return (f"umbra is {u['behind']} commit(s) behind upstream "
+            f"({u.get('installed')} → {u.get('latest')}). Tell the user: {u.get('how')}")
+
+
 # ── the check ──────────────────────────────────────────────────────────────
 
 def check(*, force: bool = False, download: bool = True) -> dict[str, Any]:
@@ -127,6 +175,14 @@ def check(*, force: bool = False, download: bool = True) -> dict[str, Any]:
                     **{k: v for k, v in st.items() if k != "last_check"}}
 
     report: dict[str, Any] = {}
+
+    # umbra — the code itself (git checkout installs only).
+    repo = umbra_repo()
+    if repo is not None:
+        try:
+            report["umbra"] = _umbra_check(repo)
+        except Exception as e:  # noqa: BLE001
+            report["umbra"] = {"error": str(e)[:200]}
 
     # cloak — only if a build is installed at all; we never pull one in
     # unasked (spawn's own prompt/fallback owns first install).
